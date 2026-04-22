@@ -1,7 +1,7 @@
 """
 不動産新着物件スクレイパー (SUUMO 中古マンション)
 - 新着物件を取得し data.csv と差分比較
-- 新着があれば LINE Notify で通知
+- 新着があれば LINE Messaging API (Push) で通知
 """
 
 import csv
@@ -17,7 +17,8 @@ from bs4 import BeautifulSoup
 # ------------------------------------------------------------------ #
 # 設定
 # ------------------------------------------------------------------ #
-LINE_TOKEN: Optional[str] = os.environ.get("LINE_TOKEN")
+LINE_CHANNEL_ACCESS_TOKEN: Optional[str] = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
+LINE_USER_ID: Optional[str] = os.environ.get("LINE_USER_ID")
 DATA_FILE = "data.csv"
 
 # 検索URLは環境変数で上書き可能
@@ -174,39 +175,62 @@ def save_listings(path: str, listings: list[Listing]) -> None:
 
 
 # ------------------------------------------------------------------ #
-# LINE Notify
+# LINE Messaging API (Push)
 # ------------------------------------------------------------------ #
+LINE_API_URL = "https://api.line.me/v2/bot/message/push"
+# 1回のAPIコールで送れるメッセージ数の上限（LINE仕様）
+_MAX_MESSAGES_PER_CALL = 5
+# 1メッセージに含める物件数
+_LISTINGS_PER_MESSAGE = 5
+
+
+def _build_text(listings: list[Listing], offset: int) -> str:
+    lines = []
+    for idx, l in enumerate(listings, start=offset + 1):
+        lines.append(
+            f"【{idx}】{l.name}\n"
+            f"  価格 : {l.price}\n"
+            f"  所在地: {l.location}\n"
+            f"  URL  : {l.url}"
+        )
+    return "\n\n".join(lines)
+
+
 def notify_line(new_listings: list[Listing]) -> None:
-    if not LINE_TOKEN:
-        print("[警告] LINE_TOKEN が未設定のため通知をスキップします。", flush=True)
+    if not LINE_CHANNEL_ACCESS_TOKEN:
+        print("[警告] LINE_CHANNEL_ACCESS_TOKEN が未設定のため通知をスキップします。", flush=True)
+        return
+    if not LINE_USER_ID:
+        print("[警告] LINE_USER_ID が未設定のため通知をスキップします。", flush=True)
         return
 
-    # 通知を 10 件ずつ分割（1メッセージが長すぎるのを防ぐ）
-    chunk_size = 10
-    for i in range(0, len(new_listings), chunk_size):
-        chunk = new_listings[i : i + chunk_size]
+    headers = {
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
 
-        lines = [f"\n🏠 新着物件 {i + 1}〜{i + len(chunk)} 件"]
-        for idx, l in enumerate(chunk, start=i + 1):
-            lines.append(
-                f"\n【{idx}】{l.name}\n"
-                f"  価格 : {l.price}\n"
-                f"  所在地: {l.location}\n"
-                f"  URL  : {l.url}"
-            )
-        message = "\n".join(lines)
+    # 物件を _LISTINGS_PER_MESSAGE 件ずつのテキストメッセージに変換
+    message_texts: list[str] = []
 
-        resp = requests.post(
-            "https://notify-api.line.me/api/notify",
-            headers={"Authorization": f"Bearer {LINE_TOKEN}"},
-            data={"message": message},
-            timeout=10,
-        )
+    # 先頭に件数サマリを追加
+    message_texts.append(f"🏠 SUUMO 新着物件 {len(new_listings)} 件が見つかりました！")
+
+    for i in range(0, len(new_listings), _LISTINGS_PER_MESSAGE):
+        chunk = new_listings[i : i + _LISTINGS_PER_MESSAGE]
+        message_texts.append(_build_text(chunk, i))
+
+    # _MAX_MESSAGES_PER_CALL 件ずつ API を呼ぶ
+    for batch_start in range(0, len(message_texts), _MAX_MESSAGES_PER_CALL):
+        batch = message_texts[batch_start : batch_start + _MAX_MESSAGES_PER_CALL]
+        payload = {
+            "to": LINE_USER_ID,
+            "messages": [{"type": "text", "text": t} for t in batch],
+        }
+        resp = requests.post(LINE_API_URL, headers=headers, json=payload, timeout=10)
         if resp.status_code != 200:
             print(f"[警告] LINE 通知失敗: {resp.status_code} {resp.text}", flush=True)
         else:
-            print(f"  LINE 通知送信: {len(chunk)} 件", flush=True)
-
+            print(f"  LINE Push 送信: {len(batch)} メッセージ", flush=True)
         time.sleep(1)
 
 
