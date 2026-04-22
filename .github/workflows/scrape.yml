@@ -1,0 +1,44 @@
+name: 不動産新着チェック
+
+on:
+  schedule:
+    # 毎日 8:00 JST (UTC 23:00) と 20:00 JST (UTC 11:00) に実行
+    - cron: "0 23 * * *"
+    - cron: "0 11 * * *"
+  workflow_dispatch: # 手動実行も可能
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # data.csv のコミットに必要
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python セットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: 依存ライブラリをインストール
+        run: pip install -r requirements.txt
+
+      - name: スクレイパーを実行
+        env:
+          LINE_TOKEN: ${{ secrets.LINE_TOKEN }}
+          # 検索URLをカスタマイズしたい場合は Secrets に TARGET_URL を追加
+          TARGET_URL: ${{ secrets.TARGET_URL }}
+        run: python scraper.py
+
+      # 新着があった場合に data.csv の変更を自動コミット
+      - name: data.csv の変更をコミット
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data.csv
+          # 変更がある場合のみコミット
+          git diff --cached --quiet || git commit -m "chore: update data.csv [skip ci]"
+          git push
