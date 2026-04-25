@@ -37,7 +37,18 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept-Language": "ja,en;q=0.9",
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
 }
 
 MAX_PAGES = 3          # 取得する最大ページ数（増やすと通知件数が増える）
@@ -63,9 +74,13 @@ class Listing:
 # ------------------------------------------------------------------ #
 def fetch_page(url: str) -> BeautifulSoup:
     resp = requests.get(url, headers=HEADERS, timeout=20)
+    print(f"  [HTTP] status={resp.status_code} url={url}", flush=True)
     resp.raise_for_status()
     resp.encoding = resp.apparent_encoding
-    return BeautifulSoup(resp.text, "html.parser")
+    soup = BeautifulSoup(resp.text, "html.parser")
+    title = soup.title.get_text(strip=True) if soup.title else "（タイトルなし）"
+    print(f"  [PAGE] title=「{title}」", flush=True)
+    return soup
 
 
 def _extract_dt_dd(card: BeautifulSoup) -> dict[str, str]:
