@@ -203,6 +203,30 @@ def _build_text(listings: list[Listing], offset: int) -> str:
     return "\n\n".join(lines)
 
 
+def notify_line_text(text: str) -> None:
+    """任意のテキスト1件を LINE に Push する。"""
+    if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_USER_ID:
+        print("[警告] LINE 認証情報が未設定のため通知をスキップします。", flush=True)
+        return
+    payload = {
+        "to": LINE_USER_ID,
+        "messages": [{"type": "text", "text": text}],
+    }
+    resp = requests.post(
+        LINE_API_URL,
+        headers={
+            "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=10,
+    )
+    if resp.status_code != 200:
+        print(f"[警告] LINE 通知失敗: {resp.status_code} {resp.text}", flush=True)
+    else:
+        print(f"  LINE Push 送信: 「{text}」", flush=True)
+
+
 def notify_line(new_listings: list[Listing]) -> None:
     if not LINE_CHANNEL_ACCESS_TOKEN:
         print("[警告] LINE_CHANNEL_ACCESS_TOKEN が未設定のため通知をスキップします。", flush=True)
@@ -266,6 +290,7 @@ def main() -> None:
         save_listings(DATA_FILE, current)
         print("data.csv を更新しました。", flush=True)
     else:
+        notify_line_text("本日のSUUMOチェック完了：新着はありませんでした")
         print("新着物件はありませんでした。", flush=True)
 
     print("=== 完了 ===", flush=True)
