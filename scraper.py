@@ -68,56 +68,48 @@ def fetch_page(url: str) -> BeautifulSoup:
     return BeautifulSoup(resp.text, "html.parser")
 
 
-def parse_listings(soup: BeautifulSoup) -> list[Listing]:
-    """
-    SUUMO の物件一覧ページをパースする。
+def _extract_dt_dd(card: BeautifulSoup) -> dict[str, str]:
+    """dl.cassetteItem_data 内の dt/dd ペアを辞書で返す。"""
+    result: dict[str, str] = {}
+    dl = card.select_one("dl.cassetteItem_data")
+    if not dl:
+        return result
+    for dt in dl.select("dt"):
+        dd = dt.find_next_sibling("dd")
+        if dd:
+            result[dt.get_text(strip=True)] = dd.get_text(strip=True)
+    return result
 
-    ※ SUUMO はサイトリニューアルでセレクタが変わることがあります。
-      実際の HTML 構造を確認して、下記セレクタを調整してください。
-    """
+
+def parse_listings(soup: BeautifulSoup) -> list[Listing]:
     results: list[Listing] = []
 
-    # 各物件カセット
-    for card in soup.select("div.cassette"):
-        # 物件名
-        name_el = card.select_one("h2.property_unit-title, .cassette_top-title")
-        name = name_el.get_text(strip=True) if name_el else "（名称不明）"
+    for card in soup.select("div.cassetteItem"):
+        # 物件名 + URL（h3.cassetteItem_title 内の a タグ）
+        title_el = card.select_one("h3.cassetteItem_title a")
+        if not title_el:
+            continue
+        name = title_el.get_text(strip=True)
+        href = title_el.get("href", "")
+        url = href if href.startswith("http") else f"https://suumo.jp{href}"
 
-        # 価格（最初の価格要素を取得）
-        price_el = card.select_one(
-            "span.dottable-value, .cassette_price-price, .price"
-        )
-        price = price_el.get_text(strip=True) if price_el else "（価格不明）"
+        # dt/dd ペアから価格・所在地を取得
+        data = _extract_dt_dd(card)
+        price    = data.get("販売価格", "（価格不明）")
+        location = data.get("所在地",   "（所在地不明）")
 
-        # 所在地
-        location_el = card.select_one(
-            ".cassette_detail-col1 li:first-child, "
-            ".dottable-valueRow .dottable-value"
-        )
-        location = location_el.get_text(strip=True) if location_el else "（所在地不明）"
-
-        # URL
-        link_el = card.select_one("a[href*='/ms/bukken/']")
-        if link_el is None:
-            link_el = card.select_one("a[href]")
-        url = ""
-        if link_el:
-            href = link_el.get("href", "")
-            url = href if href.startswith("http") else f"https://suumo.jp{href}"
-
-        if url:  # URL が取れた物件だけ追加
-            results.append(Listing(name=name, price=price, location=location, url=url))
+        results.append(Listing(name=name, price=price, location=location, url=url))
 
     return results
 
 
 def get_next_page_url(soup: BeautifulSoup, current_url: str) -> Optional[str]:
-    """「次へ」リンクの URL を返す。なければ None。"""
-    next_el = soup.select_one("p.pagination-pager_next a, a[class*='pagination'][rel='next']")
-    if not next_el:
-        return None
-    href = next_el.get("href", "")
-    return href if href.startswith("http") else f"https://suumo.jp{href}"
+    """テキストが「次へ」の a タグを探して URL を返す。なければ None。"""
+    for a in soup.select("a"):
+        if a.get_text(strip=True) == "次へ":
+            href = a.get("href", "")
+            return href if href.startswith("http") else f"https://suumo.jp{href}"
+    return None
 
 
 def scrape(start_url: str) -> list[Listing]:
