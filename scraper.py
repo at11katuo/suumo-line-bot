@@ -83,35 +83,34 @@ def fetch_page(url: str) -> BeautifulSoup:
     return soup
 
 
-def _extract_dt_dd(card: BeautifulSoup) -> dict[str, str]:
-    """dl.cassetteItem_data 内の dt/dd ペアを辞書で返す。"""
-    result: dict[str, str] = {}
-    dl = card.select_one("dl.cassetteItem_data")
-    if not dl:
-        return result
-    for dt in dl.select("dt"):
-        dd = dt.find_next_sibling("dd")
-        if dd:
-            result[dt.get_text(strip=True)] = dd.get_text(strip=True)
-    return result
-
-
 def parse_listings(soup: BeautifulSoup) -> list[Listing]:
     results: list[Listing] = []
 
-    for card in soup.select("div.cassetteItem"):
-        # 物件名 + URL（h3.cassetteItem_title 内の a タグ）
-        title_el = card.select_one("h3.cassetteItem_title a")
+    for card in soup.select("div.property_unit"):
+        # 物件名 + URL（h2.property_unit-title 内の a タグ）
+        title_el = card.select_one("h2.property_unit-title a")
         if not title_el:
             continue
         name = title_el.get_text(strip=True)
         href = title_el.get("href", "")
         url = href if href.startswith("http") else f"https://suumo.jp{href}"
 
-        # dt/dd ペアから価格・所在地を取得
-        data = _extract_dt_dd(card)
-        price    = data.get("販売価格", "（価格不明）")
-        location = data.get("所在地",   "（所在地不明）")
+        # 価格: span.dottable-value
+        price_el = card.select_one("span.dottable-value")
+        price = price_el.get_text(strip=True) if price_el else "（価格不明）"
+
+        # 所在地: "所在地" ラベルの dt の次の dd、なければ 3番目の dd にフォールバック
+        location = "（所在地不明）"
+        for dt in card.select("dt"):
+            if "所在地" in dt.get_text():
+                dd = dt.find_next_sibling("dd")
+                if dd:
+                    location = dd.get_text(strip=True)
+                    break
+        if location == "（所在地不明）":
+            dds = card.select("dd")
+            if len(dds) >= 3:
+                location = dds[2].get_text(strip=True)
 
         results.append(Listing(name=name, price=price, location=location, url=url))
 
@@ -119,8 +118,9 @@ def parse_listings(soup: BeautifulSoup) -> list[Listing]:
 
 
 def get_next_page_url(soup: BeautifulSoup, current_url: str) -> Optional[str]:
-    """テキストが「次へ」の a タグを探して URL を返す。なければ None。"""
-    for a in soup.select("a"):
+    """ページネーション内の「次へ」リンクを返す。なければ None。"""
+    nav = soup.select_one("div.pagination.pagination_set-nav")
+    for a in (nav if nav else soup).select("a"):
         if a.get_text(strip=True) == "次へ":
             href = a.get("href", "")
             return href if href.startswith("http") else f"https://suumo.jp{href}"
