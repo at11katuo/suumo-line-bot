@@ -221,10 +221,7 @@ def notify_line_text(text: str) -> None:
         json=payload,
         timeout=10,
     )
-    if resp.status_code != 200:
-        print(f"[警告] LINE 通知失敗: {resp.status_code} {resp.text}", flush=True)
-    else:
-        print(f"  LINE Push 送信: 「{text}」", flush=True)
+    print(f"LINE送信結果: {resp.status_code} - {resp.text}", flush=True)
 
 
 def notify_line(new_listings: list[Listing]) -> None:
@@ -258,10 +255,7 @@ def notify_line(new_listings: list[Listing]) -> None:
             "messages": [{"type": "text", "text": t} for t in batch],
         }
         resp = requests.post(LINE_API_URL, headers=headers, json=payload, timeout=10)
-        if resp.status_code != 200:
-            print(f"[警告] LINE 通知失敗: {resp.status_code} {resp.text}", flush=True)
-        else:
-            print(f"  LINE Push 送信: {len(batch)} メッセージ", flush=True)
+        print(f"LINE送信結果: {resp.status_code} - {resp.text}", flush=True)
         time.sleep(1)
 
 
