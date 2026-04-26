@@ -284,7 +284,6 @@ def main() -> None:
         save_listings(DATA_FILE, current)
         print("data.csv を更新しました。", flush=True)
     else:
-        notify_line_text("本日のSUUMOチェック完了：新着はありませんでした")
         print("新着物件はありませんでした。", flush=True)
 
     print("=== 完了 ===", flush=True)
