@@ -30,6 +30,7 @@ jobs:
         env:
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
           LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           # 検索URLをカスタマイズしたい場合は Secrets に TARGET_URL を追加
           TARGET_URL: ${{ secrets.TARGET_URL }}
         run: python scraper.py

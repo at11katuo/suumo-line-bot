@@ -1,16 +1,18 @@
 """
 不動産新着物件スクレイパー (SUUMO 中古マンション)
 - 新着物件を取得し data.csv と差分比較
-- 新着があれば LINE Messaging API (Push) で通知
+- Gemini API で物件を5段階評価し、4〜5★のみ LINE に通知
 """
 
 import csv
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, fields
 from typing import Optional
 
+import google.generativeai as genai
 import requests
 from bs4 import BeautifulSoup
 
@@ -19,11 +21,12 @@ from bs4 import BeautifulSoup
 # ------------------------------------------------------------------ #
 LINE_CHANNEL_ACCESS_TOKEN: Optional[str] = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_USER_ID: Optional[str] = os.environ.get("LINE_USER_ID")
+GEMINI_API_KEY: Optional[str] = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = "gemini-1.5-flash"
 DATA_FILE = "data.csv"
 
 # 検索URLは環境変数で上書き可能
 # デフォルト: 首都圏・中古マンション・5000万以下
-# SUUMO の検索条件を変えたい場合は TARGET_URL を書き換える
 DEFAULT_URL = (
     "https://suumo.jp/jj/bukken/ichiran/JJ010FJ001/"
     "?ar=030&bs=011&ta=13&cb=0.0&ct=5000.0"
@@ -51,7 +54,7 @@ HEADERS = {
     "Sec-Fetch-User": "?1",
 }
 
-MAX_PAGES = 3          # 取得する最大ページ数（増やすと通知件数が増える）
+MAX_PAGES = 3          # 取得する最大ページ数
 REQUEST_INTERVAL = 2   # ページ間のウェイト（秒）
 
 
@@ -64,6 +67,10 @@ class Listing:
     price: str
     location: str
     url: str
+    station: str = ""
+    floor_plan: str = ""
+    area: str = ""
+    age: str = ""
 
     def to_dict(self) -> dict:
         return {f.name: getattr(self, f.name) for f in fields(self)}
@@ -87,7 +94,7 @@ def parse_listings(soup: BeautifulSoup) -> list[Listing]:
     results: list[Listing] = []
 
     for card in soup.select("div.property_unit"):
-        # 物件名 + URL（h2.property_unit-title 内の a タグ）
+        # 物件名 + URL
         title_el = card.select_one("h2.property_unit-title a")
         if not title_el:
             continue
@@ -95,24 +102,31 @@ def parse_listings(soup: BeautifulSoup) -> list[Listing]:
         href = title_el.get("href", "")
         url = href if href.startswith("http") else f"https://suumo.jp{href}"
 
-        # 価格: span.dottable-value
+        # 価格
         price_el = card.select_one("span.dottable-value")
         price = price_el.get_text(strip=True) if price_el else "（価格不明）"
 
-        # 所在地: "所在地" ラベルの dt の次の dd、なければ 3番目の dd にフォールバック
-        location = "（所在地不明）"
+        # dt/dd ペアをすべて辞書化して各フィールドに割り当て
+        dt_map: dict[str, str] = {}
         for dt in card.select("dt"):
-            if "所在地" in dt.get_text():
-                dd = dt.find_next_sibling("dd")
-                if dd:
-                    location = dd.get_text(strip=True)
-                    break
-        if location == "（所在地不明）":
-            dds = card.select("dd")
-            if len(dds) >= 3:
-                location = dds[2].get_text(strip=True)
+            dd = dt.find_next_sibling("dd")
+            if dd:
+                dt_map[dt.get_text(strip=True)] = dd.get_text(strip=True)
 
-        results.append(Listing(name=name, price=price, location=location, url=url))
+        location = dt_map.get("所在地", "")
+        if not location:
+            dds = card.select("dd")
+            location = dds[2].get_text(strip=True) if len(dds) >= 3 else "（所在地不明）"
+
+        station    = dt_map.get("沿線・駅", "")
+        floor_plan = dt_map.get("間取り", "")
+        area       = dt_map.get("専有面積", "")
+        age        = dt_map.get("築年月", "") or dt_map.get("築年数", "")
+
+        results.append(Listing(
+            name=name, price=price, location=location, url=url,
+            station=station, floor_plan=floor_plan, area=area, age=age,
+        ))
 
     return results
 
@@ -149,7 +163,7 @@ def scrape(start_url: str) -> list[Listing]:
         url = next_url
         time.sleep(REQUEST_INTERVAL)
 
-    # URL 重複除去（URLを一意キーとする）
+    # URL 重複除去
     seen: set[str] = set()
     unique: list[Listing] = []
     for l in all_listings:
@@ -182,24 +196,75 @@ def save_listings(path: str, listings: list[Listing]) -> None:
 
 
 # ------------------------------------------------------------------ #
+# Gemini AI 評価
+# ------------------------------------------------------------------ #
+_SYSTEM_PROMPT = """あなたは優秀な不動産アドバイザーです。渡された中古マンションのデータを基に、以下の2点を厳しく総合的に判断し、5段階評価してください。
+住みやすさ：会社員の通勤利便性、専業主婦が日中過ごす周辺環境や買い物のしやすさ、子供2人を含む4人家族が快適に暮らせる広さと間取りであるか。
+流動性：駅からの距離、資産価値の落ちにくさ、将来的な売却・賃貸への出しやすさ。
+出力は必ず以下の形式を厳守してください。
+総合評価：★★★★☆ (4/5)
+評価コメント：[改行せずに50文字以内で、家族の住みやすさと流動性の両面からの具体的な根拠]"""
+
+
+def evaluate_listing(listing: Listing) -> tuple[int, str]:
+    """Gemini で物件を評価し (スコア, 評価テキスト) を返す。失敗時は (0, "")。"""
+    if not GEMINI_API_KEY:
+        print("  [警告] GEMINI_API_KEY 未設定のため AI 評価をスキップします。", flush=True)
+        return (0, "")
+
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel(
+        model_name=GEMINI_MODEL,
+        system_instruction=_SYSTEM_PROMPT,
+    )
+
+    prompt = "\n".join([
+        f"物件名: {listing.name}",
+        f"価格: {listing.price}",
+        f"所在地: {listing.location}",
+        f"沿線・駅: {listing.station or '不明'}",
+        f"間取り: {listing.floor_plan or '不明'}",
+        f"専有面積: {listing.area or '不明'}",
+        f"築年月: {listing.age or '不明'}",
+    ])
+
+    try:
+        response = model.generate_content(prompt)
+        text = response.text.strip()
+        m = re.search(r'\((\d)/5\)', text)
+        score = int(m.group(1)) if m else 0
+        print(f"  [AI] {score}★ {listing.name[:25]}", flush=True)
+        return (score, text)
+    except Exception as e:
+        print(f"  [警告] Gemini 評価失敗: {e}", flush=True)
+        return (0, "")
+
+
+# ------------------------------------------------------------------ #
 # LINE Messaging API (Push)
 # ------------------------------------------------------------------ #
 LINE_API_URL = "https://api.line.me/v2/bot/message/push"
-# 1回のAPIコールで送れるメッセージ数の上限（LINE仕様）
 _MAX_MESSAGES_PER_CALL = 5
-# 1メッセージに含める物件数
-_LISTINGS_PER_MESSAGE = 5
+# AI 評価テキスト分だけ文字数が増えるため 1 メッセージあたり 3 件に絞る
+_LISTINGS_PER_MESSAGE = 3
 
 
-def _build_text(listings: list[Listing], offset: int) -> str:
+def _build_text(items: list[tuple[Listing, str]], offset: int) -> str:
     lines = []
-    for idx, l in enumerate(listings, start=offset + 1):
-        lines.append(
-            f"【{idx}】{l.name}\n"
-            f"  価格 : {l.price}\n"
-            f"  所在地: {l.location}\n"
-            f"  URL  : {l.url}"
-        )
+    for idx, (l, eval_text) in enumerate(items, start=offset + 1):
+        parts = [f"【{idx}】{l.name}", f"  価格 : {l.price}", f"  所在地: {l.location}"]
+        if l.station:
+            parts.append(f"  沿線 : {l.station}")
+        if l.floor_plan or l.area:
+            parts.append(f"  間取り: {l.floor_plan}  {l.area}".strip())
+        if l.age:
+            parts.append(f"  築年月: {l.age}")
+        parts.append("  ――――――――――")
+        # 評価テキスト（複数行ある場合は各行に空白インデント）
+        for eval_line in eval_text.splitlines():
+            parts.append(f"  {eval_line}")
+        parts.append(f"  URL  : {l.url}")
+        lines.append("\n".join(parts))
     return "\n\n".join(lines)
 
 
@@ -224,7 +289,8 @@ def notify_line_text(text: str) -> None:
     print(f"LINE送信結果: {resp.status_code} - {resp.text}", flush=True)
 
 
-def notify_line(new_listings: list[Listing]) -> None:
+def notify_line(scored_listings: list[tuple[Listing, str]]) -> None:
+    """AI 評価付き物件リストを LINE に Push する。"""
     if not LINE_CHANNEL_ACCESS_TOKEN:
         print("[警告] LINE_CHANNEL_ACCESS_TOKEN が未設定のため通知をスキップします。", flush=True)
         return
@@ -237,17 +303,15 @@ def notify_line(new_listings: list[Listing]) -> None:
         "Content-Type": "application/json",
     }
 
-    # 物件を _LISTINGS_PER_MESSAGE 件ずつのテキストメッセージに変換
     message_texts: list[str] = []
+    message_texts.append(
+        f"🏠 SUUMO 新着（AI評価 4〜5★）{len(scored_listings)} 件！"
+    )
 
-    # 先頭に件数サマリを追加
-    message_texts.append(f"🏠 SUUMO 新着物件 {len(new_listings)} 件が見つかりました！")
-
-    for i in range(0, len(new_listings), _LISTINGS_PER_MESSAGE):
-        chunk = new_listings[i : i + _LISTINGS_PER_MESSAGE]
+    for i in range(0, len(scored_listings), _LISTINGS_PER_MESSAGE):
+        chunk = scored_listings[i : i + _LISTINGS_PER_MESSAGE]
         message_texts.append(_build_text(chunk, i))
 
-    # _MAX_MESSAGES_PER_CALL 件ずつ API を呼ぶ
     for batch_start in range(0, len(message_texts), _MAX_MESSAGES_PER_CALL):
         batch = message_texts[batch_start : batch_start + _MAX_MESSAGES_PER_CALL]
         payload = {
@@ -263,7 +327,7 @@ def notify_line(new_listings: list[Listing]) -> None:
 # エントリポイント
 # ------------------------------------------------------------------ #
 def main() -> None:
-    print(f"=== 不動産スクレイパー 開始 ===", flush=True)
+    print("=== 不動産スクレイパー 開始 ===", flush=True)
     print(f"対象URL: {TARGET_URL}", flush=True)
 
     # スクレイピング
@@ -278,14 +342,31 @@ def main() -> None:
     new_listings = [l for l in current if l.url not in known_urls]
     print(f"新着: {len(new_listings)} 件 (既知: {len(known_urls)} 件)", flush=True)
 
-    # 通知 & 保存
-    if new_listings:
-        notify_line(new_listings)
-        save_listings(DATA_FILE, current)
-        print("data.csv を更新しました。", flush=True)
-    else:
+    if not new_listings:
         print("新着物件はありませんでした。", flush=True)
+        print("=== 完了 ===", flush=True)
+        return
 
+    # Gemini で評価 → 4〜5★のみ抽出
+    print(f"Gemini で {len(new_listings)} 件を評価中...", flush=True)
+    scored: list[tuple[Listing, str]] = []
+    for listing in new_listings:
+        score, eval_text = evaluate_listing(listing)
+        if score >= 4:
+            scored.append((listing, eval_text))
+        time.sleep(1)  # Gemini API レート制限対策
+
+    skipped = len(new_listings) - len(scored)
+    print(f"4★以上: {len(scored)} 件 / 3★以下スキップ: {skipped} 件", flush=True)
+
+    # LINE 通知 & CSV 保存（新着が1件でもあれば必ず保存）
+    if scored:
+        notify_line(scored)
+    else:
+        print("通知対象（4★以上）の物件はありませんでした。", flush=True)
+
+    save_listings(DATA_FILE, current)
+    print("data.csv を更新しました。", flush=True)
     print("=== 完了 ===", flush=True)
 
 
