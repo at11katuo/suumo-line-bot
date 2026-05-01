@@ -12,7 +12,8 @@ import time
 from dataclasses import dataclass, fields
 from typing import Optional
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import requests
 from bs4 import BeautifulSoup
 
@@ -22,7 +23,7 @@ from bs4 import BeautifulSoup
 LINE_CHANNEL_ACCESS_TOKEN: Optional[str] = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_USER_ID: Optional[str] = os.environ.get("LINE_USER_ID")
 GEMINI_API_KEY: Optional[str] = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = "gemini-1.5-flash"
+GEMINI_MODEL = "gemini-2.0-flash"
 DATA_FILE = "data.csv"
 
 # 検索URLは環境変数で上書き可能
@@ -212,11 +213,7 @@ def evaluate_listing(listing: Listing) -> tuple[int, str]:
         print("  [警告] GEMINI_API_KEY 未設定のため AI 評価をスキップします。", flush=True)
         return (0, "")
 
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel(
-        model_name=GEMINI_MODEL,
-        system_instruction=_SYSTEM_PROMPT,
-    )
+    client = genai.Client(api_key=GEMINI_API_KEY)
 
     prompt = "\n".join([
         f"物件名: {listing.name}",
@@ -229,7 +226,13 @@ def evaluate_listing(listing: Listing) -> tuple[int, str]:
     ])
 
     try:
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=_SYSTEM_PROMPT,
+            ),
+        )
         text = response.text.strip()
         m = re.search(r'\((\d)/5\)', text)
         score = int(m.group(1)) if m else 0
