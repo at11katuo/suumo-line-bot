@@ -358,7 +358,7 @@ def main() -> None:
         score, eval_text = evaluate_listing(listing)
         if score >= 1:  # TEST: 一時的に全評価対象を通知（本番は4）
             scored.append((listing, eval_text))
-        time.sleep(1)  # Gemini API レート制限対策
+        time.sleep(5)  # Gemini API RPM制限対策（無料枠: 429回避）
 
     skipped = len(new_listings) - len(scored)
     print(f"4★以上: {len(scored)} 件 / 3★以下スキップ: {skipped} 件", flush=True)
