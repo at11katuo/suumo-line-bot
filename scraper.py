@@ -23,7 +23,7 @@ from bs4 import BeautifulSoup
 LINE_CHANNEL_ACCESS_TOKEN: Optional[str] = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_USER_ID: Optional[str] = os.environ.get("LINE_USER_ID")
 GEMINI_API_KEY: Optional[str] = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = "gemini-1.5-flash"
+GEMINI_MODEL = "gemini-2.0-flash-lite"
 DATA_FILE = "data.csv"
 
 # 検索URLは環境変数で上書き可能
