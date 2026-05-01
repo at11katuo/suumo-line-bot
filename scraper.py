@@ -226,22 +226,27 @@ def evaluate_listing(listing: Listing) -> tuple[int, str]:
         f"築年月: {listing.age or '不明'}",
     ])
 
-    try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=_SYSTEM_PROMPT,
-            ),
-        )
-        text = response.text.strip()
-        m = re.search(r'\((\d)/5\)', text)
-        score = int(m.group(1)) if m else 0
-        print(f"  [AI] {score}★ {listing.name[:25]}", flush=True)
-        return (score, text)
-    except Exception as e:
-        print(f"  [警告] Gemini 評価失敗: {e}", flush=True)
-        return (0, "")
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=_SYSTEM_PROMPT,
+                ),
+            )
+            text = response.text.strip()
+            m = re.search(r'\((\d)/5\)', text)
+            score = int(m.group(1)) if m else 0
+            print(f"  [AI] {score}★ {listing.name[:25]}", flush=True)
+            return (score, text)
+        except Exception as e:
+            print(f"  [警告] Gemini 評価失敗 (試行 {attempt}/{max_retries}): {e}", flush=True)
+            if attempt < max_retries:
+                print("  [リトライ] 60秒待機後に再試行します...", flush=True)
+                time.sleep(60)
+    return (0, "")
 
 
 # ------------------------------------------------------------------ #
