@@ -30,8 +30,9 @@ DATA_FILE = "data.csv"
 # デフォルト: 首都圏・中古マンション・5000万以下
 DEFAULT_URL = (
     "https://suumo.jp/jj/bukken/ichiran/JJ010FJ001/"
-    "?ar=030&bs=011&ta=13&cb=0.0&ct=5000.0"
-    "&md=&et=&mb=0&mt=9999999&shkr1=03&cnb=0&cn=9999999&srch_navi=1"
+    "?ar=030&bs=011&ta=13"
+    "&sc=13207&sc=13209&sc=13211"  # 調布市・稲城市・府中市
+    "&cb=0.0&ct=5000.0"            # ～5000万円
 )
 TARGET_URL: str = os.environ.get("TARGET_URL", DEFAULT_URL)
 
@@ -355,7 +356,7 @@ def main() -> None:
     scored: list[tuple[Listing, str]] = []
     for listing in new_listings:
         score, eval_text = evaluate_listing(listing)
-        if score >= 4:
+        if score >= 1:  # TEST: 一時的に全評価対象を通知（本番は4）
             scored.append((listing, eval_text))
         time.sleep(1)  # Gemini API レート制限対策
 
