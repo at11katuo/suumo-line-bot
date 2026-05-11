@@ -32,7 +32,7 @@ DATA_FILE = "data.csv"
 DEFAULT_URL = (
     "https://suumo.jp/jj/bukken/ichiran/JJ010FJ001/"
     "?ar=030&bs=011&ta=13"
-    "&sc=13207&sc=13211"   # 調布市・府中市
+    "&sc=13207&sc=13209&sc=13211"   # 調布市・稲城市・府中市
     "&cb=4000.0&ct=5500.0" # 4000万〜5500万円
 )
 TARGET_URL: str = os.environ.get("TARGET_URL", DEFAULT_URL)
