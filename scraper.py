@@ -435,7 +435,7 @@ def main() -> None:
     scored: list[tuple[Listing, str]] = []
     for listing in new_listings:
         score, eval_text = evaluate_listing(listing)
-        if score >= 4:
+        if score >= 1:  # TEST: 全件通知（本番は4）
             scored.append((listing, eval_text))
         time.sleep(15)  # Gemini API TPM制限対策（無料枠: 429回避）
 
