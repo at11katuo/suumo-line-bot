@@ -27,16 +27,13 @@ GEMINI_MODEL = "gemini-2.5-flash"
 DATA_FILE = "data.csv"
 
 # 検索URLは環境変数で上書き可能
-# 対象: 調布市・府中市 / 中古マンション / 4000〜5500万円 / 徒歩7分以内 / 65㎡以上 / 築25年以内
-# ※築10年以上の下限はSUUMO URLで直接指定不可のため、Gemini評価側でフィルタ
+# 対象: 調布市・府中市 / 中古マンション / 4000〜5500万円
+# ※徒歩・面積・築年数フィルターはURLパラメータ非対応のためPythonで後処理
 DEFAULT_URL = (
     "https://suumo.jp/jj/bukken/ichiran/JJ010FJ001/"
     "?ar=030&bs=011&ta=13"
     "&sc=13207&sc=13211"   # 調布市・府中市
     "&cb=4000.0&ct=5500.0" # 4000万〜5500万円
-    "&tj=7"                # 駅徒歩7分以内
-    "&mzb=65"              # 専有面積65㎡以上
-    "&nen=25"              # 築25年以内
 )
 TARGET_URL: str = os.environ.get("TARGET_URL", DEFAULT_URL)
 
@@ -178,6 +175,66 @@ def scrape(start_url: str) -> list[Listing]:
             unique.append(l)
 
     return unique
+
+
+# ------------------------------------------------------------------ #
+# 物件フィルタリング（URLパラメータで絞れない条件をPythonで処理）
+# ------------------------------------------------------------------ #
+def _parse_walk_minutes(station: str) -> Optional[int]:
+    """「徒歩X分」をパースして分数を返す。取得不可なら None。"""
+    m = re.search(r'徒歩\s*(\d+)\s*分', station)
+    return int(m.group(1)) if m else None
+
+
+def _parse_area_m2(area: str) -> Optional[float]:
+    """「XX.XXm2」をパースして㎡数を返す。取得不可なら None。"""
+    m = re.search(r'([\d.]+)\s*m', area)
+    return float(m.group(1)) if m else None
+
+
+def _parse_age_years(age: str) -> Optional[int]:
+    """「YYYY年M月」から築年数（年）を計算して返す。取得不可なら None。"""
+    import datetime
+    m = re.search(r'(\d{4})\s*年', age)
+    if not m:
+        return None
+    built_year = int(m.group(1))
+    return datetime.date.today().year - built_year
+
+
+def apply_filters(
+    listings: list[Listing],
+    max_walk_min: int = 7,
+    min_area_m2: float = 65.0,
+    min_age_years: int = 10,
+    max_age_years: int = 25,
+) -> list[Listing]:
+    """
+    スクレイピング後に徒歩・面積・築年数でフィルタリング。
+    値が取得できない物件は条件通過とみなす（見逃し防止）。
+    """
+    passed, skipped = [], []
+    for l in listings:
+        walk = _parse_walk_minutes(l.station)
+        area = _parse_area_m2(l.area)
+        age  = _parse_age_years(l.age)
+
+        if walk is not None and walk > max_walk_min:
+            skipped.append((l.name[:20], f"徒歩{walk}分"))
+            continue
+        if area is not None and area < min_area_m2:
+            skipped.append((l.name[:20], f"{area}㎡"))
+            continue
+        if age is not None and not (min_age_years <= age <= max_age_years):
+            skipped.append((l.name[:20], f"築{age}年"))
+            continue
+        passed.append(l)
+
+    if skipped:
+        print(f"  [フィルタ除外] {len(skipped)} 件:", flush=True)
+        for name, reason in skipped:
+            print(f"    - {name}… ({reason})", flush=True)
+    return passed
 
 
 # ------------------------------------------------------------------ #
@@ -358,6 +415,10 @@ def main() -> None:
         print("物件が取得できませんでした。セレクタを確認してください。", flush=True)
         sys.exit(1)
     print(f"合計取得: {len(current)} 件", flush=True)
+
+    # Pythonフィルタ（徒歩7分以内・65㎡以上・築10〜25年）
+    current = apply_filters(current, max_walk_min=7, min_area_m2=65.0, min_age_years=10, max_age_years=25)
+    print(f"フィルタ後: {len(current)} 件", flush=True)
 
     # 差分比較
     known_urls = load_known_urls(DATA_FILE)
