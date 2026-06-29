@@ -5,6 +5,7 @@
 """
 
 import csv
+import json
 import os
 import re
 import sys
@@ -59,6 +60,11 @@ HEADERS = {
 
 MAX_PAGES = 3          # 取得する最大ページ数
 REQUEST_INTERVAL = 2   # ページ間のウェイト（秒）
+
+# 有望物件の判定しきい値
+PROMISING_SCORE_THRESHOLD = 70    # 売りやすさスコアの下限（100点満点）
+PROMISING_VS_FAIR_MAX_PCT  = 5.0  # 実勢比乖離率の上限（+は割高）
+EVAL_CITY_CODE = "13208"          # 評価に使うエリアコード（現時点は調布市のみ）
 
 
 # ------------------------------------------------------------------ #
@@ -403,6 +409,209 @@ def notify_line(scored_listings: list[tuple[Listing, str]]) -> None:
 
 
 # ------------------------------------------------------------------ #
+# 価格変動通知（値下げ・スコア改善アラート）
+# ------------------------------------------------------------------ #
+
+def _build_text_price_drop(alert: dict) -> str:
+    """値下げ・スコア改善アラートの本文を1件分組み立てる。"""
+    today = alert["today"]
+    prev  = alert["prev"]
+    drop  = alert["price_drop"]   # 正の値 = 価格が下がった（円）
+    gain  = alert["score_gain"]   # 正の値 = スコアが上がった（点）
+
+    parts = [f"【{alert['name']}】"]
+
+    # 価格の変化
+    t_price = today.get("asking_price")
+    p_price = prev.get("asking_price")
+    if t_price is not None and p_price is not None:
+        t_man    = t_price / 10_000
+        p_man    = p_price / 10_000
+        drop_man = drop / 10_000
+        drop_pct = drop / p_price * 100 if p_price else 0
+        if drop > 0:
+            parts.append(f"  価格  : {p_man:.0f}万円 → {t_man:.0f}万円")
+            parts.append(f"          ↓ -{drop_man:.0f}万円（-{drop_pct:.1f}%）")
+        else:
+            parts.append(f"  価格  : {t_man:.0f}万円（変化なし）")
+
+    # スコアの変化
+    t_score = today.get("resale_score")
+    p_score = prev.get("resale_score")
+    if t_score is not None and p_score is not None:
+        if gain > 0:
+            parts.append(f"  スコア: {t_score}/100（前回 {p_score} → +{gain}点）")
+        elif gain < 0:
+            parts.append(f"  スコア: {t_score}/100（前回 {p_score} → {gain}点）")
+        else:
+            parts.append(f"  スコア: {t_score}/100（変化なし）")
+
+    parts.append(f"  URL   : {alert['url']}")
+    parts.append(
+        f"  前回  : {prev.get('evaluated_date', '?')} / "
+        f"今回: {today.get('evaluated_date', '?')}"
+    )
+    return "\n".join(parts)
+
+
+def notify_line_price_drops(alerts: list[dict]) -> None:
+    """値下げ・スコア改善アラートを LINE に一括通知する。"""
+    if not alerts:
+        return
+    if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_USER_ID:
+        print("[警告] LINE 認証情報が未設定のため価格変動通知をスキップします。", flush=True)
+        return
+
+    # ヘッダー + 1件1メッセージで組み立て、_MAX_MESSAGES_PER_CALL 件ずつ送信
+    message_texts: list[str] = [f"📉 価格変動のお知らせ（{len(alerts)}件）"]
+    for alert in alerts:
+        message_texts.append(_build_text_price_drop(alert))
+
+    headers = {
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    for batch_start in range(0, len(message_texts), _MAX_MESSAGES_PER_CALL):
+        batch = message_texts[batch_start : batch_start + _MAX_MESSAGES_PER_CALL]
+        payload = {
+            "to": LINE_USER_ID,
+            "messages": [{"type": "text", "text": t} for t in batch],
+        }
+        resp = requests.post(LINE_API_URL, headers=headers, json=payload, timeout=10)
+        print(f"LINE送信結果（価格変動）: {resp.status_code} - {resp.text}", flush=True)
+        time.sleep(1)
+
+
+# ------------------------------------------------------------------ #
+# 2段階通知（有望物件＝強調版 / それ以外＝控えめ版）
+# ------------------------------------------------------------------ #
+
+def _is_promising(est: dict) -> bool:
+    """
+    有望物件かどうか判定する。
+    - resale_score が PROMISING_SCORE_THRESHOLD 以上
+    - asking_vs_fair_pct が PROMISING_VS_FAIR_MAX_PCT 以下（None なら無視）
+    """
+    score = est.get("resale_score")
+    if score is None or score < PROMISING_SCORE_THRESHOLD:
+        return False
+    vs_fair = est.get("asking_vs_fair_pct")
+    if vs_fair is not None and vs_fair > PROMISING_VS_FAIR_MAX_PCT:
+        return False
+    return True
+
+
+def _build_text_promising(
+    listing: Listing,
+    eval_text: str,
+    est: dict,
+    idx: int,
+) -> str:
+    """強調版メッセージ（有望物件用）。reinfolib の評価数値を冒頭に差し込む。"""
+    hold_years = est.get("hold_years", 10)
+    parts = ["★★ 有望物件 ★★", f"【{idx}】{listing.name}", ""]
+
+    score   = est.get("resale_score")
+    vs_fair = est.get("asking_vs_fair_pct")
+    future  = est.get("future_resale_price")
+    if score is not None:
+        parts.append(f"売りやすさスコア : {score}/100")
+    if vs_fair is not None:
+        direction = "割安" if vs_fair <= 0 else "割高"
+        parts.append(f"実勢比          : {vs_fair:+.1f}%（{direction}）")
+    if future is not None:
+        parts.append(f"{hold_years}年後 想定売却額: 約{future / 10_000:.0f}万円")
+
+    parts.append("")
+    parts.append(f"価格 : {listing.price}")
+    parts.append(f"所在地: {listing.location}")
+    if listing.station:
+        parts.append(f"沿線 : {listing.station}")
+    if listing.floor_plan or listing.area:
+        parts.append(f"間取り: {listing.floor_plan}  {listing.area}".strip())
+    if listing.age:
+        parts.append(f"築年月: {listing.age}")
+    parts.append("――――――――――")
+
+    for line in eval_text.splitlines():
+        parts.append(line)
+
+    try:
+        for note in json.loads(est.get("notes", "[]")):
+            parts.append(f"⚠ {note}")
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    parts.append(f"URL  : {listing.url}")
+    return "\n".join(parts)
+
+
+def _build_text_compact(listing: Listing, idx: int) -> str:
+    """控えめ版メッセージ（通常物件・評価スキップ物件用）。物件名・価格・駅徒歩・URL のみ。"""
+    station_short = listing.station.split()[-1] if listing.station else ""
+    detail = " / ".join(filter(None, [listing.price, listing.floor_plan, station_short]))
+    return f"【{idx}】{listing.name}\n  {detail}\n  URL: {listing.url}"
+
+
+_COMPACT_PER_MESSAGE = 5  # 控えめ版は1メッセージに最大5件まとめる
+
+
+def notify_line_two_stage(
+    scored: list[tuple[Listing, str]],
+    est_map: dict[str, dict],
+) -> None:
+    """
+    2段階LINE通知。
+    - 有望物件（_is_promising=True） → 強調版、1件1メッセージ
+    - それ以外（評価スキップ含む） → 控えめ版、最大5件まとめて1メッセージ
+    est_map が空のとき（評価失敗フォールバック）は全件が控えめ版になる。
+    """
+    if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_USER_ID:
+        print("[警告] LINE 認証情報が未設定のため通知をスキップします。", flush=True)
+        return
+
+    promising = [(l, t) for l, t in scored if _is_promising(est_map.get(l.url, {}))]
+    normal    = [(l, t) for l, t in scored if not _is_promising(est_map.get(l.url, {}))]
+
+    message_texts: list[str] = []
+
+    header = f"🏠 SUUMO 新着 {len(scored)}件"
+    if promising:
+        header += f"（うち有望物件 {len(promising)}件）"
+    message_texts.append(header)
+
+    for rank, (listing, eval_text) in enumerate(promising, start=1):
+        message_texts.append(
+            _build_text_promising(listing, eval_text, est_map.get(listing.url, {}), rank)
+        )
+
+    if normal:
+        offset = len(promising)
+        compact_parts = [
+            _build_text_compact(l, offset + i + 1)
+            for i, (l, _) in enumerate(normal)
+        ]
+        for i in range(0, len(compact_parts), _COMPACT_PER_MESSAGE):
+            message_texts.append(
+                "\n\n".join(compact_parts[i : i + _COMPACT_PER_MESSAGE])
+            )
+
+    headers = {
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    for batch_start in range(0, len(message_texts), _MAX_MESSAGES_PER_CALL):
+        batch = message_texts[batch_start : batch_start + _MAX_MESSAGES_PER_CALL]
+        payload = {
+            "to": LINE_USER_ID,
+            "messages": [{"type": "text", "text": t} for t in batch],
+        }
+        resp = requests.post(LINE_API_URL, headers=headers, json=payload, timeout=10)
+        print(f"LINE送信結果: {resp.status_code} - {resp.text}", flush=True)
+        time.sleep(1)
+
+
+# ------------------------------------------------------------------ #
 # エントリポイント
 # ------------------------------------------------------------------ #
 def main() -> None:
@@ -425,6 +634,28 @@ def main() -> None:
     new_listings = [l for l in current if l.url not in known_urls]
     print(f"新着: {len(new_listings)} 件 (既知: {len(known_urls)} 件)", flush=True)
 
+    # 国交省評価（current 全件。新着がなくても値下げ検知のために毎日実行）
+    # ・カーブはエリア単位キャッシュを使い回すため、物件数によらず
+    #   API 呼び出しはエリア数ぶん（現時点では 1 回）に抑えられる。
+    # ・毎日 current 件数ぶんの行が DB に積まれる（価格変動追跡の意図した仕様）。
+    # ・例外が出ても後続の通知（2段階・価格変動とも）に影響しない。
+    price_drop_alerts: list[dict] = []
+    est_map: dict[str, dict] = {}
+    try:
+        from evaluator import evaluate_and_save, load_evaluations_today, detect_changes  # 循環インポート回避
+        evaluate_and_save(current, city_code=EVAL_CITY_CODE)
+        price_drop_alerts = detect_changes([l.url for l in current])
+        # est_map は新着物件の2段階通知用にのみ使うため new_listings のURLに絞る
+        est_map = load_evaluations_today([l.url for l in new_listings])
+    except Exception as e:
+        print(f"[警告] 評価パイプライン失敗（通知は継続）: {e}", flush=True)
+
+    # 値下げ・スコア改善通知（2段階通知より先に送る）
+    if price_drop_alerts:
+        notify_line_price_drops(price_drop_alerts)
+    else:
+        print("価格変動のある物件はありませんでした。", flush=True)
+
     if not new_listings:
         print("新着物件はありませんでした。", flush=True)
         print("=== 完了 ===", flush=True)
@@ -442,9 +673,9 @@ def main() -> None:
     skipped = len(new_listings) - len(scored)
     print(f"4★以上: {len(scored)} 件 / 3★以下スキップ: {skipped} 件", flush=True)
 
-    # LINE 通知 & CSV 保存（新着が1件でもあれば必ず保存）
+    # LINE 通知（2段階）& CSV 保存（新着が1件でもあれば必ず保存）
     if scored:
-        notify_line(scored)
+        notify_line_two_stage(scored, est_map)
     else:
         print("通知対象（4★以上）の物件はありませんでした。", flush=True)
 
