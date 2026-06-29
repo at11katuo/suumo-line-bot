@@ -64,7 +64,6 @@ REQUEST_INTERVAL = 2   # ページ間のウェイト（秒）
 # 有望物件の判定しきい値
 PROMISING_SCORE_THRESHOLD = 70    # 売りやすさスコアの下限（100点満点）
 PROMISING_VS_FAIR_MAX_PCT  = 5.0  # 実勢比乖離率の上限（+は割高）
-EVAL_CITY_CODE = "13208"          # 評価に使うエリアコード（現時点は調布市のみ）
 
 
 # ------------------------------------------------------------------ #
@@ -635,15 +634,31 @@ def main() -> None:
     print(f"新着: {len(new_listings)} 件 (既知: {len(known_urls)} 件)", flush=True)
 
     # 国交省評価（current 全件。新着がなくても値下げ検知のために毎日実行）
+    # ・物件を所在市でグルーピングし、エリアごとに正しいカーブで評価する。
     # ・カーブはエリア単位キャッシュを使い回すため、物件数によらず
-    #   API 呼び出しはエリア数ぶん（現時点では 1 回）に抑えられる。
+    #   API 呼び出しはエリア数ぶん（調布・府中・稲城 各1回）に抑えられる。
     # ・毎日 current 件数ぶんの行が DB に積まれる（価格変動追跡の意図した仕様）。
     # ・例外が出ても後続の通知（2段階・価格変動とも）に影響しない。
     price_drop_alerts: list[dict] = []
     est_map: dict[str, dict] = {}
     try:
-        from evaluator import evaluate_and_save, load_evaluations_today, detect_changes  # 循環インポート回避
-        evaluate_and_save(current, city_code=EVAL_CITY_CODE)
+        from evaluator import evaluate_and_save, load_evaluations_today, detect_changes, resolve_city_code  # 循環インポート回避
+
+        # 所在地から市区町村コードを判定してグルーピング
+        city_groups: dict[str, list[Listing]] = {}
+        skipped_city = 0
+        for listing in current:
+            code = resolve_city_code(listing.location)
+            if code is not None:
+                city_groups.setdefault(code, []).append(listing)
+            else:
+                print(f"  [警告] 市コード判定不可のためスキップ: {listing.location!r}", flush=True)
+                skipped_city += 1
+        # エリアごとに対応するカーブで評価して DB に保存
+        for city_code, listings_for_city in city_groups.items():
+            evaluate_and_save(listings_for_city, city_code=city_code)
+        print(f"市コード判定不可でスキップ: {skipped_city}件", flush=True)
+
         price_drop_alerts = detect_changes([l.url for l in current])
         # est_map は新着物件の2段階通知用にのみ使うため new_listings のURLに絞る
         est_map = load_evaluations_today([l.url for l in new_listings])

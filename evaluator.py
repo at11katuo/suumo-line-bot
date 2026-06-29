@@ -184,6 +184,25 @@ def _city_name(city_code: str) -> str:
     return city_code
 
 
+def resolve_city_code(location: str) -> Optional[str]:
+    """
+    Listing.location の住所文字列から市区町村コードを引く。
+    TARGET_AREAS に登録された市名（"調布市" 等）が含まれていれば対応コードを返す。
+    3市外・所在地不明など一致しない場合は None を返す。
+
+    例:
+        "東京都調布市曙町" → "13208"
+        "東京都府中市中町" → "13206"
+        "東京都稲城市矢野口" → "13225"
+        "東京都世田谷区砧" → None
+        "（所在地不明）"   → None
+    """
+    for city_name, code in TARGET_AREAS.items():
+        if city_name in location:
+            return code
+    return None
+
+
 # ---------------------------------------------------------------------------
 # パイプライン関数（公開インターフェース）
 # ---------------------------------------------------------------------------
