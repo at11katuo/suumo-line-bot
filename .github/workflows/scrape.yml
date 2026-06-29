@@ -1,5 +1,18 @@
 name: 不動産新着チェック
 
+# ============================================================
+# 動作確認手順 (workflow_dispatch で手動実行)
+#
+# 1回目:
+#   キャッシュなし → DB なし → 値下げ検知はスキップ
+#   新着物件の2段階通知のみ動作する
+#   実行後: evaluations.db と cache/ がキャッシュに保存される
+#
+# 2回目 (翌日 or 再度 workflow_dispatch):
+#   キャッシュから DB 復元 → 前回評価との比較が有効になる
+#   SUUMO の価格が前回より 50万円以上下がっていれば📉通知が届く
+# ============================================================
+
 on:
   schedule:
     # 毎日 8:00 JST (UTC 23:00) と 20:00 JST (UTC 11:00) に実行
@@ -11,36 +24,88 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # data.csv のコミットに必要
+      contents: write   # data.csv のコミット・プッシュに必要
 
     steps:
+      # ---- 1. リポジトリをチェックアウト ----
       - name: リポジトリをチェックアウト
         uses: actions/checkout@v4
 
+      # ---- 2. Python 環境を準備 ----
       - name: Python セットアップ
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: "pip"
+          cache: "pip"   # requirements.txt が変わらない限りインストールをキャッシュ
 
       - name: 依存ライブラリをインストール
         run: pip install -r requirements.txt
 
+      # ---- 3. DB・カーブキャッシュを復元 ----
+      # GitHub Actions は実行ごとに環境がリセットされるため、
+      # evaluations.db（評価履歴）と cache/（国交省カーブ JSON）を
+      # actions/cache で実行間に引き継ぐ。
+      #
+      # [キー設計について]
+      # GitHub Actions の cache は「同一キーが存在するとき保存しない」仕様のため、
+      # 固定キー（"suumo-eval-db"）のみだと初回保存後は更新されず DB が凍結する。
+      # そこで key に github.run_id を付けて毎回ユニークキーとし、ジョブ終了後の
+      # ポストステップで必ず最新の DB を保存する。
+      # restore-keys のプレフィックス一致（"suumo-eval-db-"）で直前実行の
+      # 最新キャッシュを引き継ぐため、DB の履歴は途切れない。
+      #
+      # 初回実行（キャッシュなし）: 復元スキップ → DB なしで後続ステップが動く
+      #   → evaluations.db がなくても scraper.py は動くよう設計済み（値下げ検知のみスキップ）
+      # 2回目以降: 直前の run のキャッシュを復元 → 前回評価との比較が有効になる
+      - name: DB・カーブキャッシュ復元
+        uses: actions/cache@v4
+        with:
+          path: |
+            evaluations.db
+            cache
+          key: suumo-eval-db-${{ github.run_id }}
+          restore-keys: |
+            suumo-eval-db-
+      # ↑ このステップのポストステップが、ジョブ終了後に
+      #   evaluations.db と cache/ を自動でキャッシュ保存する。
+      #   明示的な save ステップは不要。
+
+      # ---- 4. 国交省 API から減価カーブを取得 ----
+      # cache/ に有効な JSON（90日以内）があれば API を叩かない。
+      # 物件数によらず API 呼び出しはエリア数ぶんだけ（現時点: 調布市 1回）。
+      # カーブはエリア単位でキャッシュされるため、物件が何件あっても API コールは増えない。
+      # API キーが未設定でも警告のみで終了し、後続ステップへの影響はない。
+      - name: 減価カーブ取得（国交省 API / 90日キャッシュ優先）
+        env:
+          REINFOLIB_API_KEY: ${{ secrets.REINFOLIB_API_KEY }}
+        run: python build_curves.py
+
+      # ---- 5. スクレイパーを実行 ----
+      # 実行順序:
+      #   (1) SUUMO 収集 → フィルタ（徒歩・面積・築年数）→ 差分比較（新着判定）
+      #   (2) 全現行物件を国交省データで評価 → evaluations.db に今日の行を追加
+      #       ※ API 呼び出しは上の build_curves.py で済んでいるためここでは発生しない
+      #   (3) 前回評価との比較で値下げ・スコア改善を検知 → 📉 価格変動 LINE 通知
+      #   (4) 新着物件を Gemini AI で評価 → ★ 2段階 LINE 通知（有望物件 / 通常物件）
+      #   (5) data.csv を更新
       - name: スクレイパーを実行
         env:
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
           LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          REINFOLIB_API_KEY: ${{ secrets.REINFOLIB_API_KEY }}
           # 検索URLをカスタマイズしたい場合は Secrets に TARGET_URL を追加
           TARGET_URL: ${{ secrets.TARGET_URL }}
         run: python scraper.py
 
-      # 新着があった場合に data.csv の変更を自動コミット
+      # ---- 6. data.csv の変更を自動コミット ----
+      # evaluations.db と cache/ は .gitignore 対象のため git add しない
+      # （actions/cache で永続化するため git 管理は不要）。
       - name: data.csv の変更をコミット
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data.csv
-          # 変更がある場合のみコミット
+          # 新着物件がなければ data.csv は変化しないのでコミットをスキップ
           git diff --cached --quiet || git commit -m "chore: update data.csv [skip ci]"
           git push
