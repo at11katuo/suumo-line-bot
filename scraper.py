@@ -32,9 +32,10 @@ DATA_FILE = "data.csv"
 # ※徒歩・面積・築年数フィルターはURLパラメータ非対応のためPythonで後処理
 DEFAULT_URL = (
     "https://suumo.jp/jj/bukken/ichiran/JJ010FJ001/"
-    "?ar=030&bs=011&ta=13"
-    "&sc=13207&sc=13209&sc=13211"   # 調布市・稲城市・府中市
-    "&cb=4000.0&ct=5500.0" # 4000万〜5500万円
+    "?ar=030&bs=011&ta=13&jspIdFlg=patternShikugun"
+    "&sc=13206&sc=13208&sc=13225"   # 府中市(13206)・調布市(13208)・稲城市(13225)
+    "&kb=4000&kt=5500"              # 4000万〜5500万円
+    "&mb=0&mt=9999999&ekTjCd=&ekTjNm=&tj=0&cnb=0&cn=9999999&srch_navi=1"
 )
 TARGET_URL: str = os.environ.get("TARGET_URL", DEFAULT_URL)
 
@@ -545,11 +546,24 @@ def _build_text_promising(
     return "\n".join(parts)
 
 
-def _build_text_compact(listing: Listing, idx: int) -> str:
-    """控えめ版メッセージ（通常物件・評価スキップ物件用）。物件名・価格・駅徒歩・URL のみ。"""
+def _build_text_compact(listing: Listing, idx: int, eval_text: str = "") -> str:
+    """控えめ版メッセージ（通常物件・評価スキップ物件用）。
+    物件名・価格・駅徒歩・URL に加え、Gemini の懸念点が抽出できれば1行だけ添える
+    （簡潔さ維持のため懸念点のみ。全文は出さない）。
+    eval_text 未指定（""）や懸念点なしのときは従来通り懸念点行を足さない。"""
     station_short = listing.station.split()[-1] if listing.station else ""
     detail = " / ".join(filter(None, [listing.price, listing.floor_plan, station_short]))
-    return f"【{idx}】{listing.name}\n  {detail}\n  URL: {listing.url}"
+    parts = [f"【{idx}】{listing.name}", f"  {detail}"]
+
+    # Gemini 評価テキストから「懸念点：xxx」の行だけ抜き出して添える。
+    # 全角／半角コロン両対応。`.` は改行を含まないので懸念点の1行だけ取得する。
+    # 抽出できない（空文字・懸念点なし）ときは何も足さない＝落ちない。
+    m = re.search(r'懸念点[：:]\s*(.+)', eval_text)
+    if m and m.group(1).strip():
+        parts.append(f"  ⚠ 懸念点: {m.group(1).strip()}")
+
+    parts.append(f"  URL: {listing.url}")
+    return "\n".join(parts)
 
 
 _COMPACT_PER_MESSAGE = 5  # 控えめ版は1メッセージに最大5件まとめる
@@ -587,8 +601,8 @@ def notify_line_two_stage(
     if normal:
         offset = len(promising)
         compact_parts = [
-            _build_text_compact(l, offset + i + 1)
-            for i, (l, _) in enumerate(normal)
+            _build_text_compact(l, offset + i + 1, eval_text)
+            for i, (l, eval_text) in enumerate(normal)
         ]
         for i in range(0, len(compact_parts), _COMPACT_PER_MESSAGE):
             message_texts.append(

@@ -190,6 +190,20 @@ class TestBuildTextCompact:
         promising = _build_text_promising(make_listing(), "AI評価テキスト", make_est(), 1)
         assert len(compact) < len(promising)
 
+    def test_includes_concern_when_present(self):
+        # eval_text に「懸念点：xxx」があれば、その内容が控えめ版にも1行出る
+        eval_text = "総合評価：買い\n懸念点：駅から徒歩15分とやや遠い\nおすすめ度：B"
+        result = _build_text_compact(make_listing(), 1, eval_text)
+        assert "懸念点" in result
+        assert "駅から徒歩15分とやや遠い" in result
+
+    def test_no_concern_line_when_eval_text_empty(self):
+        # eval_text 未指定（評価スキップ等）でも落ちず、懸念点行は付かない
+        result = _build_text_compact(make_listing(), 1, "")
+        assert "懸念点" not in result
+        # デフォルト引数省略時と完全に同じ結果（既存呼び出しとの互換性）
+        assert result == _build_text_compact(make_listing(), 1)
+
 
 # ---------------------------------------------------------------------------
 # notify_line_two_stage のテスト（LINE API をモック）
