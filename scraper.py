@@ -643,6 +643,24 @@ def main() -> None:
     est_map: dict[str, dict] = {}
     try:
         from evaluator import evaluate_and_save, load_evaluations_today, detect_changes, resolve_city_code  # 循環インポート回避
+        from detail_fetcher import fetch_detail, load_detail_cache, save_detail_cache, get_uncached_urls  # 循環インポート回避
+
+        # ── 詳細取得（新着 & 未登録のみ）──────────────────────────────
+        # new_listings のうち detail_cache に「一度も登録されていない」URLだけを取得する。
+        # 登録済み（取得失敗で NULL の場合も含む）は再取得しない。
+        # アクセス数 = 未登録の新着件数のみ（通常は当日の新着件数）。
+        new_listing_urls  = [l.url for l in new_listings]
+        uncached_urls_set = set(get_uncached_urls(new_listing_urls))
+        for listing in new_listings:
+            if listing.url not in uncached_urls_set:
+                continue  # detail_cache に登録済みはスキップ（重複 fetch 防止）
+            data = fetch_detail(listing.url)  # 内部で4秒待機・timeout=15秒
+            # 失敗（data=None）のときも「試み済み」として保存し、次回の重複 fetch を防ぐ
+            save_detail_cache(listing.url, data or {"total_units": None, "repair_fund_monthly": None})
+
+        # current 全件のキャッシュを DB から一括読み込み（新着は今保存、既知は以前保存）
+        detail_cache = load_detail_cache([l.url for l in current])
+        # ──────────────────────────────────────────────────────────────
 
         # 所在地から市区町村コードを判定してグルーピング
         city_groups: dict[str, list[Listing]] = {}
@@ -654,9 +672,9 @@ def main() -> None:
             else:
                 print(f"  [警告] 市コード判定不可のためスキップ: {listing.location!r}", flush=True)
                 skipped_city += 1
-        # エリアごとに対応するカーブで評価して DB に保存
+        # エリアごとに対応するカーブで評価して DB に保存（detail_cache を渡して精度向上）
         for city_code, listings_for_city in city_groups.items():
-            evaluate_and_save(listings_for_city, city_code=city_code)
+            evaluate_and_save(listings_for_city, city_code=city_code, detail_cache=detail_cache)
         print(f"市コード判定不可でスキップ: {skipped_city}件", flush=True)
 
         price_drop_alerts = detect_changes([l.url for l in current])

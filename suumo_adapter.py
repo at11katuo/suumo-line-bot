@@ -111,7 +111,10 @@ def _parse_walk_minutes(station_str: str) -> Optional[int]:
 # 変換関数（公開インターフェース）
 # ---------------------------------------------------------------------------
 
-def suumo_to_candidate(listing: Listing) -> Optional[Candidate]:
+def suumo_to_candidate(
+    listing: Listing,
+    detail: Optional[dict] = None,
+) -> Optional[Candidate]:
     """
     SUUMO の Listing を reinfolib_resale の Candidate に変換して返す。
 
@@ -119,8 +122,18 @@ def suumo_to_candidate(listing: Listing) -> Optional[Candidate]:
     None を返す（バッチ処理でこの物件をスキップする合図）。
     取得できなかったフィールド名は logging.warning に記録する。
 
-    total_units / repair_fund_per_sqm は SUUMO 一覧カードに載っていないため
-    常に None。将来、詳細ページ取得を実装した際に埋める想定。
+    引数:
+        listing: SUUMO スクレイピング結果
+        detail : detail_fetcher.fetch_detail() の戻り値（または None）。
+                 {"total_units": int|None, "repair_fund_monthly": float|None} 形式。
+                 None のとき（詳細未取得 or 取得失敗）は total_units / repair_fund_per_sqm が
+                 中立（None）のまま → スコアに影響しない（フォールバック動作）。
+
+    修繕積立金の㎡換算:
+        詳細ページの値は月額総額（例: 24,080円/月）。
+        estimate_resale の repair_fund_per_sqm は「月額 ÷ 専有面積（円/㎡/月）」を期待する。
+        例: 24,080円 ÷ 70.6㎡ ≈ 341円/㎡ → 200円以上なので減点なし（健全）。
+        換算はここで行う（area_sqm が確定している場所が最適）。
     """
     asking_price  = _parse_price(listing.price)
     area_sqm      = _parse_area(listing.area)
@@ -143,12 +156,23 @@ def suumo_to_candidate(listing: Listing) -> Optional[Candidate]:
         )
         return None
 
+    # ---- 詳細データ（任意）→ total_units と repair_fund_per_sqm の算出 ----
+    total_units = None
+    repair_fund_per_sqm = None
+    if detail:
+        total_units = detail.get("total_units")
+        repair_fund_monthly = detail.get("repair_fund_monthly")
+        # 修繕積立金月額 ÷ 専有面積 → ㎡単価（円/㎡/月）に換算する。
+        # 0除算ガード付き（area_sqm は必須フィールドなのでここでは None にならない）。
+        if repair_fund_monthly is not None and area_sqm:
+            repair_fund_per_sqm = repair_fund_monthly / area_sqm
+
     return Candidate(
         asking_price=asking_price,
         area_sqm=area_sqm,
         building_year=building_year,
         walk_minutes=_parse_walk_minutes(listing.station),
-        total_units=None,           # SUUMO 一覧カードでは取得不可
-        repair_fund_per_sqm=None,   # SUUMO 一覧カードでは取得不可
+        total_units=total_units,
+        repair_fund_per_sqm=repair_fund_per_sqm,
         floor_plan=listing.floor_plan or "",
     )

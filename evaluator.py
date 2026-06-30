@@ -214,6 +214,7 @@ def evaluate_and_save(
     hold_years: int = DEFAULT_HOLD_YEARS,
     current_year: Optional[int] = None,
     _evaluated_date: Optional[str] = None,
+    detail_cache: Optional[dict] = None,
 ) -> int:
     """
     Listing リストを評価して SQLite に保存する。
@@ -225,6 +226,9 @@ def evaluate_and_save(
         hold_years      : 想定保有年数（デフォルト: DEFAULT_HOLD_YEARS=10年）
         current_year    : 評価基準年（None のとき今年を使う）
         _evaluated_date : テスト用。"YYYY-MM-DD" を渡すと今日の日付の代わりに使われる
+        detail_cache    : {url: {"total_units": int|None, "repair_fund_monthly": float|None}}
+                          detail_fetcher.load_detail_cache() の戻り値を渡す。
+                          None のとき（または URL が含まれないとき）は中立スコアにフォールバック。
 
     戻り値:
         保存した件数（スキップされた物件は含まない）
@@ -255,8 +259,12 @@ def evaluate_and_save(
         saved = 0
 
         for listing in listings:
-            # Listing → Candidate（変換失敗は None → スキップ）
-            candidate = suumo_to_candidate(listing)
+            # Listing → Candidate（詳細キャッシュがあれば total_units / repair_fund_per_sqm も設定）
+            # detail_cache に URL がない場合（未取得 or 取得失敗）は detail=None → 中立スコア
+            candidate = suumo_to_candidate(
+                listing,
+                detail=detail_cache.get(listing.url) if detail_cache else None,
+            )
             if candidate is None:
                 continue  # suumo_to_candidate 側で warning ログ済み
 
