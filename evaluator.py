@@ -432,6 +432,63 @@ def detect_changes(
     return alerts
 
 
+def get_listing_age_days(
+    url: str,
+    db_path: Path = DB_PATH,
+    _today: Optional[str] = None,
+) -> Optional[int]:
+    """
+    指定 URL が evaluations 履歴に「初めて現れた日」から今日までの経過日数を返す。
+
+    ⚠ 重要な注意（誤解防止）:
+        これは SUUMO の実際の掲載日ではなく、このボットが初めてこの物件を
+        評価DBに記録した日からの日数（観測開始からの日数）である。
+        DB はボット稼働開始以降しか存在しないため、稼働前から出ていた物件は
+        実際の掲載期間より短く出る。あくまで「売れ残り」の近似指標として使う。
+
+    戻り値:
+        経過日数（0 以上の int）。
+        DB がない・該当 URL の履歴がない・日付が壊れている・例外時は None
+        （通知側で「行を出さない」判断に使う。ここでは絶対に例外を投げない）。
+
+    引数:
+        url    : 対象物件の URL
+        db_path: SQLite ファイルのパス
+        _today : テスト用。"YYYY-MM-DD" を渡すと today の代わりに使われる
+    """
+    today_str = _today or date.today().isoformat()
+    if not db_path.exists():
+        return None
+
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            # evaluated_date は "YYYY-MM-DD"。ISO 形式なので文字列 MIN = 最古日。
+            row = conn.execute(
+                "SELECT MIN(evaluated_date) FROM evaluations WHERE listing_url = ?",
+                (url,),
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        # テーブル未作成など。履歴なし扱い。
+        return None
+
+    # 該当行なし → MIN は (None,) を返す
+    if row is None or row[0] is None:
+        return None
+
+    try:
+        first_date = date.fromisoformat(row[0])
+        today_date = date.fromisoformat(today_str)
+    except (ValueError, TypeError):
+        return None
+
+    delta = (today_date - first_date).days
+    # 念のため負値（未来日付が混入した場合）は 0 に丸める
+    return delta if delta >= 0 else 0
+
+
 # ---------------------------------------------------------------------------
 # エントリポイント（手動実行・動作確認用）
 # ---------------------------------------------------------------------------

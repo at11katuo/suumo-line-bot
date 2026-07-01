@@ -501,11 +501,29 @@ def _is_promising(est: dict) -> bool:
     return True
 
 
+def _format_listing_age(age_days: Optional[int]) -> Optional[str]:
+    """
+    確認継続日数の表示文字列を返す。履歴なし（age_days=None）のときは None を返し、
+    呼び出し側で「行を出さない」判断に使う。
+
+    ※ SUUMO の掲載日ではなく「このボットが観測し始めてからの日数」であることが
+      伝わる文言にしている（実掲載日との誤解を防ぐため）。
+        age_days = 0  → "本日はじめて確認"
+        age_days >= 1 → "確認してから N日目"
+    """
+    if age_days is None:
+        return None
+    if age_days <= 0:
+        return "本日はじめて確認"
+    return f"確認してから {age_days}日目"
+
+
 def _build_text_promising(
     listing: Listing,
     eval_text: str,
     est: dict,
     idx: int,
+    age_days: Optional[int] = None,
 ) -> str:
     """強調版メッセージ（有望物件用）。reinfolib の評価数値を冒頭に差し込む。"""
     hold_years = est.get("hold_years", 10)
@@ -531,6 +549,10 @@ def _build_text_promising(
         parts.append(f"間取り: {listing.floor_plan}  {listing.area}".strip())
     if listing.age:
         parts.append(f"築年月: {listing.age}")
+    # 確認継続日数（履歴があれば1行。売れ残り判断の補助）
+    age_line = _format_listing_age(age_days)
+    if age_line:
+        parts.append(age_line)
     parts.append("――――――――――")
 
     for line in eval_text.splitlines():
@@ -546,7 +568,12 @@ def _build_text_promising(
     return "\n".join(parts)
 
 
-def _build_text_compact(listing: Listing, idx: int, eval_text: str = "") -> str:
+def _build_text_compact(
+    listing: Listing,
+    idx: int,
+    eval_text: str = "",
+    age_days: Optional[int] = None,
+) -> str:
     """控えめ版メッセージ（通常物件・評価スキップ物件用）。
     物件名・価格・駅徒歩・URL に加え、Gemini の懸念点が抽出できれば1行だけ添える
     （簡潔さ維持のため懸念点のみ。全文は出さない）。
@@ -561,6 +588,11 @@ def _build_text_compact(listing: Listing, idx: int, eval_text: str = "") -> str:
     m = re.search(r'懸念点[：:]\s*(.+)', eval_text)
     if m and m.group(1).strip():
         parts.append(f"  ⚠ 懸念点: {m.group(1).strip()}")
+
+    # 確認継続日数（履歴があれば URL の直前に1行）
+    age_line = _format_listing_age(age_days)
+    if age_line:
+        parts.append(f"  {age_line}")
 
     parts.append(f"  URL: {listing.url}")
     return "\n".join(parts)
@@ -583,6 +615,15 @@ def notify_line_two_stage(
         print("[警告] LINE 認証情報が未設定のため通知をスキップします。", flush=True)
         return
 
+    # 各物件の「観測開始からの日数」を DB 履歴から引く。
+    # DBなし・履歴なし・例外は None（＝表示しない）になり、通知は止めない。
+    try:
+        from evaluator import get_listing_age_days  # 循環インポート回避
+        age_map = {l.url: get_listing_age_days(l.url) for l, _ in scored}
+    except Exception as e:
+        print(f"[警告] 確認継続日数の取得に失敗（通知は継続）: {e}", flush=True)
+        age_map = {}
+
     promising = [(l, t) for l, t in scored if _is_promising(est_map.get(l.url, {}))]
     normal    = [(l, t) for l, t in scored if not _is_promising(est_map.get(l.url, {}))]
 
@@ -595,13 +636,16 @@ def notify_line_two_stage(
 
     for rank, (listing, eval_text) in enumerate(promising, start=1):
         message_texts.append(
-            _build_text_promising(listing, eval_text, est_map.get(listing.url, {}), rank)
+            _build_text_promising(
+                listing, eval_text, est_map.get(listing.url, {}), rank,
+                age_days=age_map.get(listing.url),
+            )
         )
 
     if normal:
         offset = len(promising)
         compact_parts = [
-            _build_text_compact(l, offset + i + 1, eval_text)
+            _build_text_compact(l, offset + i + 1, eval_text, age_days=age_map.get(l.url))
             for i, (l, eval_text) in enumerate(normal)
         ]
         for i in range(0, len(compact_parts), _COMPACT_PER_MESSAGE):

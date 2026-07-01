@@ -20,6 +20,7 @@ from scraper import (
     Listing,
     _build_text_compact,
     _build_text_promising,
+    _format_listing_age,
     _is_promising,
     notify_line_two_stage,
 )
@@ -165,6 +166,17 @@ class TestBuildTextPromising:
         text = _build_text_promising(make_listing(), "AI評価", make_est(asking_vs_fair_pct=None), 1)
         assert "実勢比" not in text
 
+    def test_shows_age_line_when_provided(self):
+        # age_days を渡すと「確認してから N日目」が出る
+        text = _build_text_promising(make_listing(), "AI評価", make_est(), 1, age_days=5)
+        assert "確認してから 5日目" in text
+
+    def test_no_age_line_when_age_days_none(self):
+        # age_days 未指定（None）なら確認継続の行は出ない（既存互換）
+        text = _build_text_promising(make_listing(), "AI評価", make_est(), 1)
+        assert "確認してから" not in text
+        assert "本日はじめて確認" not in text
+
 
 # ---------------------------------------------------------------------------
 # _build_text_compact のテスト
@@ -203,6 +215,41 @@ class TestBuildTextCompact:
         assert "懸念点" not in result
         # デフォルト引数省略時と完全に同じ結果（既存呼び出しとの互換性）
         assert result == _build_text_compact(make_listing(), 1)
+
+    def test_shows_age_line_when_provided(self):
+        # age_days を渡すと控えめ版にも「確認してから N日目」が出る
+        result = _build_text_compact(make_listing(), 1, "", age_days=3)
+        assert "確認してから 3日目" in result
+
+    def test_no_age_line_when_age_days_none(self):
+        # age_days 未指定なら確認継続の行は出ない（既存互換）
+        result = _build_text_compact(make_listing(), 1, "", age_days=None)
+        assert "確認してから" not in result
+        assert result == _build_text_compact(make_listing(), 1)
+
+
+# ---------------------------------------------------------------------------
+# _format_listing_age のテスト（表示文言）
+# ---------------------------------------------------------------------------
+
+class TestFormatListingAge:
+    """観測日数 → 表示文言の変換。SUUMO掲載日と誤解されない文言であることを確認。"""
+
+    def test_none_returns_none(self):
+        # 履歴なし → None（行を出さない合図）
+        assert _format_listing_age(None) is None
+
+    def test_zero_is_today_first_seen(self):
+        # 本日初出 → 「本日はじめて確認」
+        assert _format_listing_age(0) == "本日はじめて確認"
+
+    def test_positive_is_days_since_first_seen(self):
+        assert _format_listing_age(7) == "確認してから 7日目"
+
+    def test_wording_does_not_imply_suumo_listing_date(self):
+        # 「掲載」という語を使わない（SUUMO実掲載日との誤解防止）
+        assert "掲載" not in _format_listing_age(0)
+        assert "掲載" not in _format_listing_age(10)
 
 
 # ---------------------------------------------------------------------------

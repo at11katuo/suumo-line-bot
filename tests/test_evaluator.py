@@ -21,7 +21,7 @@ import pytest
 
 import build_curves
 import evaluator
-from evaluator import DEFAULT_HOLD_YEARS, evaluate_and_save
+from evaluator import DEFAULT_HOLD_YEARS, evaluate_and_save, get_listing_age_days
 from scraper import Listing
 
 # ---------------------------------------------------------------------------
@@ -293,3 +293,46 @@ class TestHistory:
         assert prices[0] == 42_000_000  # 1月10日
         assert prices[1] == 40_000_000  # 1月20日
         assert prices[0] > prices[1]    # 値下がりを確認
+
+
+# ---------------------------------------------------------------------------
+# 4. get_listing_age_days（観測開始からの経過日数）
+# ---------------------------------------------------------------------------
+
+class TestListingAgeDays:
+    """
+    get_listing_age_days の仕様検証。
+    最古の evaluated_date から today までの日数を返す。
+    履歴なし・DBなしは None（通知側で「行を出さない」判断に使う）。
+    """
+
+    URL = "https://suumo.jp/test/99999/"
+
+    def test_multiple_history_returns_days_from_oldest(self, db_path):
+        # 1/10・1/20 に評価履歴 → today=1/25 なら最古(1/10)からの15日を返す
+        evaluate_and_save([make_listing()], CHOFU_CODE, db_path=db_path,
+                          _evaluated_date="2026-01-10")
+        evaluate_and_save([make_listing()], CHOFU_CODE, db_path=db_path,
+                          _evaluated_date="2026-01-20")
+        age = get_listing_age_days(self.URL, db_path=db_path, _today="2026-01-25")
+        assert age == 15  # 1/10 → 1/25
+
+    def test_first_seen_today_returns_zero(self, db_path):
+        # 本日初めて評価された物件 → 0（呼び出し側で「本日はじめて確認」表示）
+        evaluate_and_save([make_listing()], CHOFU_CODE, db_path=db_path,
+                          _evaluated_date="2026-01-10")
+        age = get_listing_age_days(self.URL, db_path=db_path, _today="2026-01-10")
+        assert age == 0
+
+    def test_no_history_for_url_returns_none(self, db_path):
+        # DB はあるが対象 URL の履歴がない → None
+        evaluate_and_save([make_listing(url="https://suumo.jp/test/OTHER/")],
+                          CHOFU_CODE, db_path=db_path, _evaluated_date="2026-01-10")
+        age = get_listing_age_days(self.URL, db_path=db_path, _today="2026-01-25")
+        assert age is None
+
+    def test_missing_db_returns_none(self, tmp_path):
+        # DB ファイル自体が存在しない → None（落ちない）
+        age = get_listing_age_days(self.URL, db_path=tmp_path / "no.db",
+                                   _today="2026-01-25")
+        assert age is None
