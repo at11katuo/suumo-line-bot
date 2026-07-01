@@ -669,6 +669,137 @@ def notify_line_two_stage(
 
 
 # ------------------------------------------------------------------ #
+# 参考枠通知（Gemini 4★未満だが reinfolib 有望な物件を別枠で控えめに通知）
+#   ※ 既存の2段階通知（強調版/控えめ版）とは独立した第3カテゴリ。
+#      Gemini の一次選別という設計思想を尊重し、強調版とは混同させない。
+# ------------------------------------------------------------------ #
+
+_REFERENCE_HEADER = (
+    "📋 参考（AI評価対象外・データ上は割安）\n"
+    "※AIの自動抽出（4★以上）には入りませんでしたが、市場データ上は\n"
+    "　割安圏の物件です。AIの評価理由も併記します。過信にご注意ください。"
+)
+
+
+def _build_text_reference(
+    listing: Listing,
+    gemini_score: int,
+    eval_text: str,
+    est: dict,
+    idx: int,
+    age_days: Optional[int] = None,
+) -> str:
+    """
+    参考枠メッセージの1物件分を組み立てる。
+    Gemini が 4★未満（自動抽出の対象外）としたが reinfolib 評価では有望な物件を、
+    「データ（reinfolib）」と「AI 判断（Gemini）」の両方が見える形で控えめに示す。
+    過信を防ぐため、AI の★数と懸念点を必ず併記する。
+    """
+    parts = [f"【{idx}】{listing.name}", f"  価格 : {listing.price}"]
+
+    # reinfolib のデータ評価（スコア・実勢比）
+    score   = est.get("resale_score")
+    vs_fair = est.get("asking_vs_fair_pct")
+    data_bits = []
+    if score is not None:
+        data_bits.append(f"スコア{score}/100")
+    if vs_fair is not None:
+        direction = "割安" if vs_fair <= 0 else "割高"
+        data_bits.append(f"実勢比 {vs_fair:+.1f}%（{direction}）")
+    if data_bits:
+        parts.append(f"  データ評価: {' ・ '.join(data_bits)}")
+
+    # AI（Gemini）の判断を必ず併記。★数と懸念点で「なぜ自動抽出外だったか」を示す（過信防止）。
+    if gemini_score >= 1:
+        ai_line = f"  AI評価: {gemini_score}★（5段階）"
+    else:
+        ai_line = "  AI評価: 判定できず（AI応答なし）"
+    # eval_text から「懸念点：xxx」の行だけ抜き出して添える（抽出できなければ節を省略）
+    m = re.search(r'懸念点[：:]\s*(.+)', eval_text)
+    if m and m.group(1).strip():
+        ai_line += f" / 懸念点: {m.group(1).strip()}"
+    parts.append(ai_line)
+
+    # 掲載日数（前回追加した _format_listing_age を流用。履歴があれば1行）
+    age_line = _format_listing_age(age_days)
+    if age_line:
+        parts.append(f"  {age_line}")
+
+    parts.append(f"  URL : {listing.url}")
+    return "\n".join(parts)
+
+
+def notify_line_reference(
+    rejected: list[tuple[Listing, int, str]],
+    est_map: dict[str, dict],
+) -> None:
+    """
+    参考枠通知（独立した第3カテゴリ）。
+    Gemini 4★未満（自動抽出の対象外）だが reinfolib 評価で有望な物件だけを、
+    強調版とは別の控えめな見出しで通知する。
+
+    引数:
+        rejected: (listing, gemini★, eval_text) のリスト。
+                  scored（4★以上）に入らなかった物件のみが渡される。
+        est_map : 物件URL → reinfolib 評価結果。
+
+    仕様:
+        - reinfolib 有望（_is_promising）に該当する物件が0件なら、
+          メッセージは一切送信しない（ログのみ）。
+        - rejected は scored に含まれない物件のみなので、同一物件が
+          強調版/控えめ版と参考枠の両方に出ることはない。
+    """
+    if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_USER_ID:
+        print("[警告] LINE 認証情報が未設定のため参考枠通知をスキップします。", flush=True)
+        return
+
+    # reinfolib 有望なものだけを抽出（ここが参考枠の対象）
+    targets = [
+        (listing, gemini_score, eval_text)
+        for listing, gemini_score, eval_text in rejected
+        if _is_promising(est_map.get(listing.url, {}))
+    ]
+    if not targets:
+        print("参考枠（AI対象外×データ割安）の該当はありませんでした。", flush=True)
+        return
+
+    # 掲載日数を DB 履歴から引く（失敗しても通知は止めない）
+    try:
+        from evaluator import get_listing_age_days  # 循環インポート回避
+        age_map = {l.url: get_listing_age_days(l.url) for l, _, _ in targets}
+    except Exception as e:
+        print(f"[警告] 参考枠の確認継続日数の取得に失敗（通知は継続）: {e}", flush=True)
+        age_map = {}
+
+    message_texts: list[str] = [_REFERENCE_HEADER]
+    blocks = [
+        _build_text_reference(
+            listing, gemini_score, eval_text,
+            est_map.get(listing.url, {}), i + 1,
+            age_days=age_map.get(listing.url),
+        )
+        for i, (listing, gemini_score, eval_text) in enumerate(targets)
+    ]
+    # 控えめ版と同様、_COMPACT_PER_MESSAGE 件ずつ束ねる
+    for i in range(0, len(blocks), _COMPACT_PER_MESSAGE):
+        message_texts.append("\n\n".join(blocks[i : i + _COMPACT_PER_MESSAGE]))
+
+    headers = {
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    for batch_start in range(0, len(message_texts), _MAX_MESSAGES_PER_CALL):
+        batch = message_texts[batch_start : batch_start + _MAX_MESSAGES_PER_CALL]
+        payload = {
+            "to": LINE_USER_ID,
+            "messages": [{"type": "text", "text": t} for t in batch],
+        }
+        resp = requests.post(LINE_API_URL, headers=headers, json=payload, timeout=10)
+        print(f"LINE送信結果（参考枠）: {resp.status_code} - {resp.text}", flush=True)
+        time.sleep(1)
+
+
+# ------------------------------------------------------------------ #
 # エントリポイント
 # ------------------------------------------------------------------ #
 def main() -> None:
@@ -754,11 +885,15 @@ def main() -> None:
 
     # Gemini で評価 → 4〜5★のみ抽出
     print(f"Gemini で {len(new_listings)} 件を評価中...", flush=True)
-    scored: list[tuple[Listing, str]] = []
+    scored:   list[tuple[Listing, str]]      = []
+    rejected: list[tuple[Listing, int, str]] = []  # (listing, gemini★, eval_text)
     for listing in new_listings:
         score, eval_text = evaluate_listing(listing)
         if score >= 4:
             scored.append((listing, eval_text))
+        else:
+            # 4★未満は従来は捨てていた。参考枠判定のため (物件, ★数, 評価文) を保持する。
+            rejected.append((listing, score, eval_text))
         time.sleep(15)  # Gemini API TPM制限対策（無料枠: 429回避）
 
     skipped = len(new_listings) - len(scored)
@@ -769,6 +904,10 @@ def main() -> None:
         notify_line_two_stage(scored, est_map)
     else:
         print("通知対象（4★以上）の物件はありませんでした。", flush=True)
+
+    # 参考枠（独立した第3カテゴリ）: Gemini 4★未満だが reinfolib 有望な物件だけを通知。
+    # 該当0件なら内部で何も送らない。既存の2段階通知には一切影響しない。
+    notify_line_reference(rejected, est_map)
 
     save_listings(DATA_FILE, current)
     print("data.csv を更新しました。", flush=True)

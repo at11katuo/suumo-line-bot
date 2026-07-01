@@ -20,8 +20,10 @@ from scraper import (
     Listing,
     _build_text_compact,
     _build_text_promising,
+    _build_text_reference,
     _format_listing_age,
     _is_promising,
+    notify_line_reference,
     notify_line_two_stage,
 )
 
@@ -336,3 +338,175 @@ class TestNotifyLineTwoStage:
         with patch("scraper.requests.post") as mock_post:
             notify_line_two_stage([(make_listing(), "AI評価")], {})
         mock_post.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _build_text_reference のテスト（参考枠の1物件分の整形）
+# ---------------------------------------------------------------------------
+
+class TestBuildTextReference:
+    """
+    参考枠の本文。データ（reinfolib）と AI 判断（Gemini）の両方が
+    見えること、過信防止のため AI★数・懸念点が併記されることを検証。
+    """
+
+    def test_shows_reinfolib_score_and_vs_fair(self):
+        est = make_est(resale_score=75, asking_vs_fair_pct=-15.3)
+        text = _build_text_reference(make_listing(), 1, "AI評価", est, 1)
+        assert "スコア75/100" in text
+        assert "実勢比 -15.3%（割安）" in text
+
+    def test_shows_gemini_star_count(self):
+        # AI の★数を必ず併記（なぜ自動抽出外かが分かる）
+        text = _build_text_reference(make_listing(), 1, "★☆☆☆☆ (1/5)", make_est(), 1)
+        assert "AI評価: 1★（5段階）" in text
+
+    def test_shows_concern_from_eval_text(self):
+        eval_text = "★☆☆☆☆ (1/5)\n懸念点：駅から徒歩18分と遠い"
+        text = _build_text_reference(make_listing(), 1, eval_text, make_est(), 1)
+        assert "懸念点: 駅から徒歩18分と遠い" in text
+
+    def test_gemini_score_zero_shows_undetermined(self):
+        # Gemini 応答失敗（score=0）→「判定できず」表示（0★とは出さない）
+        text = _build_text_reference(make_listing(), 0, "", make_est(), 1)
+        assert "判定できず" in text
+        assert "0★" not in text
+
+    def test_no_concern_section_when_absent(self):
+        # 懸念点が抽出できないときは懸念点の節を省略（AI★数の行自体は残る）
+        text = _build_text_reference(make_listing(), 2, "★★☆☆☆ (2/5)", make_est(), 1)
+        assert "懸念点" not in text
+        assert "AI評価: 2★（5段階）" in text
+
+    def test_shows_age_line_when_provided(self):
+        text = _build_text_reference(make_listing(), 1, "AI評価", make_est(), 1, age_days=5)
+        assert "確認してから 5日目" in text
+
+    def test_contains_name_price_url(self):
+        text = _build_text_reference(make_listing(), 1, "AI評価", make_est(), 1)
+        assert "テスト物件マンション101" in text
+        assert "4,200万円" in text
+        assert "https://suumo.jp/test/99999/" in text
+
+    def test_not_emphasized_header(self):
+        # 参考枠の本文は強調版の見出しを含まない（混同防止）
+        text = _build_text_reference(make_listing(), 1, "AI評価", make_est(), 1)
+        assert "★★ 有望物件 ★★" not in text
+
+
+# ---------------------------------------------------------------------------
+# notify_line_reference のテスト（LINE API をモック）
+# ---------------------------------------------------------------------------
+
+class TestNotifyLineReference:
+
+    def test_sent_for_gemini_low_but_reinfolib_promising(self, line_env):
+        # Gemini 1★（4★未満）だが reinfolib 有望 → 参考枠が送信される
+        listing  = make_listing()
+        rejected = [(listing, 1, "★☆☆☆☆ (1/5)\n懸念点：駅から遠い")]
+        est      = make_est(resale_score=75, asking_vs_fair_pct=-15.3)
+
+        with patch("scraper.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=200, text="OK")
+            notify_line_reference(rejected, {listing.url: est})
+
+        sent = _collect_sent_texts(mock_post)
+        assert any("📋 参考" in t for t in sent)
+        assert any("テスト物件マンション101" in t for t in sent)
+
+    def test_message_has_caution_and_ai_info(self, line_env):
+        # 「過信注意」の一文と、AI★数・懸念点が必ず併記される（設計の要）
+        listing  = make_listing()
+        rejected = [(listing, 1, "★☆☆☆☆ (1/5)\n懸念点：1階で陽当たり難")]
+
+        with patch("scraper.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=200, text="OK")
+            notify_line_reference(rejected, {listing.url: make_est()})
+
+        blob = "\n".join(_collect_sent_texts(mock_post))
+        assert "過信" in blob               # 過信注意の一文
+        assert "AI評価: 1★" in blob          # Gemini の★数
+        assert "1階で陽当たり難" in blob      # Gemini の懸念点
+
+    def test_not_confused_with_emphasized(self, line_env):
+        # 参考枠は強調版の見出しを一切含まない
+        listing  = make_listing()
+        rejected = [(listing, 1, "★☆☆☆☆ (1/5)")]
+
+        with patch("scraper.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=200, text="OK")
+            notify_line_reference(rejected, {listing.url: make_est()})
+
+        blob = "\n".join(_collect_sent_texts(mock_post))
+        assert "★★ 有望物件 ★★" not in blob
+
+    def test_no_message_when_none_promising(self, line_env):
+        # rejected はあるが reinfolib 有望が0件 → メッセージを一切送らない
+        listing  = make_listing()
+        rejected = [(listing, 1, "★☆☆☆☆ (1/5)")]
+        est      = make_est(resale_score=60)  # 70未満 → 非有望
+
+        with patch("scraper.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=200, text="OK")
+            notify_line_reference(rejected, {listing.url: est})
+
+        mock_post.assert_not_called()
+
+    def test_empty_rejected_sends_nothing(self, line_env):
+        # rejected 自体が空 → 何も送らない
+        with patch("scraper.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=200, text="OK")
+            notify_line_reference([], {})
+        mock_post.assert_not_called()
+
+    def test_no_line_token_skips_without_exception(self, monkeypatch):
+        # LINE 認証情報が未設定でも例外を出さずスキップ
+        monkeypatch.setattr(scraper, "LINE_CHANNEL_ACCESS_TOKEN", None)
+        monkeypatch.setattr(scraper, "LINE_USER_ID", None)
+        listing = make_listing()
+        with patch("scraper.requests.post") as mock_post:
+            notify_line_reference([(listing, 1, "AI評価")], {listing.url: make_est()})
+        mock_post.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 非回帰: 参考枠の追加で強調版/控えめ版が変わらない・重複しないこと
+# ---------------------------------------------------------------------------
+
+class TestReferenceDoesNotAffectTwoStage:
+    """
+    参考枠（第3カテゴリ）が既存の2段階通知に影響しないこと、
+    同一物件が両方の通知に出ないことを確認する。
+    """
+
+    def test_promising_in_scored_still_emphasized_and_no_reference(self, line_env):
+        # 有望物件が scored（Gemini通過）にある通常ケース:
+        # 強調版で出て、参考枠（rejected 空）は何も送らない
+        listing = make_listing()
+        est     = make_est(resale_score=75, asking_vs_fair_pct=-3.0)
+
+        with patch("scraper.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=200, text="OK")
+            notify_line_two_stage([(listing, "AI評価")], {listing.url: est})
+        two_stage_blob = "\n".join(_collect_sent_texts(mock_post))
+        assert "★★ 有望物件 ★★" in two_stage_blob  # 強調版は従来どおり
+
+        with patch("scraper.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=200, text="OK")
+            notify_line_reference([], {listing.url: est})  # scored のものは rejected に入らない
+        mock_post.assert_not_called()
+
+    def test_same_listing_not_notified_by_both(self, line_env):
+        # 同一の有望物件を、両ルートに同時投入することは main() では起きないが、
+        # 「rejected 経由なら参考枠のみ・scored 経由なら強調版のみ」で出力が
+        # 重複しない（片方に入れたらもう片方の入力には現れない）ことを確認。
+        listing = make_listing()
+        est     = make_est(resale_score=75, asking_vs_fair_pct=-15.3)
+
+        # rejected 経由 → 参考枠のみ（強調版の見出しは出ない）
+        with patch("scraper.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=200, text="OK")
+            notify_line_reference([(listing, 1, "★☆☆☆☆ (1/5)")], {listing.url: est})
+        ref_blob = "\n".join(_collect_sent_texts(mock_post))
+        assert "📋 参考" in ref_blob
+        assert "★★ 有望物件 ★★" not in ref_blob
