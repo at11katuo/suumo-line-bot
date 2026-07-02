@@ -1,8 +1,9 @@
 """
 tests/test_sashine.py
 ====================
-sashine.calc_negotiation_targets（STEP1）と
-sashine.recalc_estimate_at_price / is_promising_at_price（STEP2）のテスト。
+sashine.calc_negotiation_targets（STEP1）、
+sashine.recalc_estimate_at_price / is_promising_at_price（STEP2）、
+sashine.determine_aggressiveness / find_sashine_candidate（STEP3）のテスト。
 
 期待値は手計算後、実際に関数を実行して数値を照合してから埋め込んでいる
 （浮動小数点の丸め誤差を含めて実際の挙動と一致させるため）。
@@ -12,9 +13,11 @@ import math
 
 import pytest
 
-from reinfolib_resale import Candidate, DepreciationCurve, estimate_resale
+from reinfolib_resale import Candidate, DepreciationCurve, ResaleEstimate, estimate_resale
 from sashine import (
     calc_negotiation_targets,
+    determine_aggressiveness,
+    find_sashine_candidate,
     is_promising_at_price,
     recalc_estimate_at_price,
 )
@@ -387,3 +390,199 @@ class TestThresholdConsistencyWithScraper:
             "asking_vs_fair_pct": est.asking_vs_fair_pct,
         })
         assert is_promising_at_price(candidate, curve, 2026, 10, negotiated_price) == manual_result
+
+
+# ---------------------------------------------------------------------------
+# STEP3-1. determine_aggressiveness: 観測日数から強気度を決定
+# ---------------------------------------------------------------------------
+
+class TestDetermineAggressiveness:
+    """境界値（29/30/89/90日）を1つずつ固定する。"""
+
+    def test_none_returns_mild(self):
+        # 履歴なし（bot稼働初期など）は安全側のmild扱い
+        assert determine_aggressiveness(None) == "mild"
+
+    def test_zero_days_returns_mild(self):
+        assert determine_aggressiveness(0) == "mild"
+
+    def test_29_days_returns_mild(self):
+        assert determine_aggressiveness(29) == "mild"
+
+    def test_30_days_returns_standard(self):
+        # 境界: 30日ちょうどから standard
+        assert determine_aggressiveness(30) == "standard"
+
+    def test_89_days_returns_standard(self):
+        assert determine_aggressiveness(89) == "standard"
+
+    def test_90_days_returns_aggressive(self):
+        # 境界: 90日ちょうどから aggressive
+        assert determine_aggressiveness(90) == "aggressive"
+
+    def test_large_value_returns_aggressive(self):
+        assert determine_aggressiveness(365) == "aggressive"
+
+    def test_negative_days_returns_mild(self):
+        # get_listing_age_days は0以上しか返さない契約だが、防御的に
+        # 負値でも例外を出さず mild 扱いになることを確認
+        assert determine_aggressiveness(-5) == "mild"
+
+
+# ---------------------------------------------------------------------------
+# STEP3-2. find_sashine_candidate 用の共通フィクスチャ
+# ---------------------------------------------------------------------------
+#
+# curve/candidate は STEP2 の fixture（築8年→バケット(6,10)、10年後は
+# 築18年→バケット(16,20)、fair_price_now=5,040万円）をそのまま流用する。
+# asking_price=5,500万円・score=90・vs_fair=+9.13%（非有望）が既定状態。
+
+def _make_est(score: int, vs_fair) -> ResaleEstimate:
+    """
+    条件1・4のゲート判定だけを狙って検証するための、手作りの ResaleEstimate。
+    current_fair_price 等は fixture の curve（fair_price_now=5,040万円）に
+    合わせた値を入れているが、条件1・4はスコアと乖離率しか見ないため
+    厳密な整合性は不要（ゲート単体テスト用）。
+    """
+    return ResaleEstimate(
+        current_fair_unit_price=700_000,
+        current_fair_price=50_400_000,
+        asking_vs_fair_pct=vs_fair,
+        future_unit_price=600_000,
+        future_resale_price=43_200_000,
+        net_after_tax_and_cost=0.0,
+        resale_score=score,
+        notes=[],
+    )
+
+
+# ---------------------------------------------------------------------------
+# STEP3-3. 歯止め条件の回帰テスト（最重要）
+# ---------------------------------------------------------------------------
+#
+# 条件1〜4のそれぞれについて「その条件だけを満たさない」ケースを個別に
+# 用意し、Noneが返ることを固定する。将来コードが変わってもここが
+# レッドになれば歯止めが緩んだことにすぐ気づける。
+
+class TestFindSashineCandidateGateConditions:
+
+    def test_condition1_alone_blocks_when_already_promising(self, candidate, curve):
+        # 条件1: スコア80点・乖離率+2% → 既に有望(_is_promising=True)なので
+        # 条件4(vs_fair>0)を満たすかどうかに関わらず条件1で除外される
+        est_now = _make_est(score=80, vs_fair=2.0)
+        assert _is_promising({"resale_score": 80, "asking_vs_fair_pct": 2.0}) is True
+        result = find_sashine_candidate(candidate, curve, 2026, 10, 100, est_now)
+        assert result is None
+
+    def test_condition4_alone_blocks_when_vs_fair_negative(self, candidate, curve):
+        # 条件4: スコア60点・乖離率-3% → 非有望(_is_promising=False、条件1は
+        # 満たす＝通過)だが、既に割安(vs_fair<=0)のため条件4で除外される
+        est_now = _make_est(score=60, vs_fair=-3.0)
+        assert _is_promising({"resale_score": 60, "asking_vs_fair_pct": -3.0}) is False
+        result = find_sashine_candidate(candidate, curve, 2026, 10, 100, est_now)
+        assert result is None
+
+    def test_condition4_blocks_at_exact_zero_boundary(self, candidate, curve):
+        # 乖離率がちょうど0%（fair価格と同額）も「プラスではない」として除外
+        est_now = _make_est(score=60, vs_fair=0.0)
+        result = find_sashine_candidate(candidate, curve, 2026, 10, 100, est_now)
+        assert result is None
+
+    def test_condition4_blocks_when_vs_fair_unknown(self, candidate, curve):
+        # 実勢価格が不明（vs_fair=None）は「プラスと判定できない」として除外
+        # （不明を通過扱いにしない＝安全側に倒す設計）
+        est_now = _make_est(score=60, vs_fair=None)
+        result = find_sashine_candidate(candidate, curve, 2026, 10, 100, est_now)
+        assert result is None
+
+    def test_condition2_alone_blocks_when_score_too_low_even_at_target(self, curve):
+        # 条件2: resale_score は asking_price に依存しないため、スコアが
+        # 低い物件はどれだけ値引きしても target 価格でもスコアは変わらず
+        # 非有望のまま → 条件1・3・4は満たしても条件2で除外される
+        low_score_cand = Candidate(
+            asking_price=60_000_000, area_sqm=40, building_year=1998,
+            walk_minutes=15, total_units=10, repair_fund_per_sqm=100,
+        )
+        est_now = estimate_resale(low_score_cand, curve, 2026, 10)
+        assert est_now.resale_score < 70          # 低スコアであることの前提確認
+        assert est_now.asking_vs_fair_pct > 0      # 条件4は満たす（割高ではある）
+        result = find_sashine_candidate(low_score_cand, curve, 2026, 10, 100, est_now)
+        assert result is None
+
+    def test_cand_none_returns_none_without_exception(self, curve):
+        est_now = _make_est(score=60, vs_fair=9.0)
+        assert find_sashine_candidate(None, curve, 2026, 10, 100, est_now) is None
+
+    def test_est_now_none_returns_none_without_exception(self, candidate, curve):
+        assert find_sashine_candidate(candidate, curve, 2026, 10, 100, None) is None
+
+    def test_low_score_positive_vs_fair_passes_gates_1_and_4(self, candidate, curve):
+        """
+        条件1・4は est_now だけを見るため、est_now のスコアが低くても
+        （条件1的には「非有望」を満たす）乖離率がプラスなら条件1・4は
+        両方通過する。この物件が最終的に候補になるかどうかは、条件2で
+        再計算される est_at_target のスコア（= cand の実際の属性から
+        computed される値。est_now.resale_score とは独立）で決まる。
+
+        ここでは candidate fixture（実属性からのスコアは90点）を使うため、
+        est_now に手作りの低スコア(65点)を入れても、est_at_target は
+        cand の実属性から90点で再計算され、最終的に候補として返る。
+        「条件1・4は est_now を見るが、条件2は cand の実属性を見る」
+        という非対称性を示すテスト（歯止めが誤って est_now.resale_score を
+        使い回していないことの確認にもなる）。
+        """
+        est_now = _make_est(score=65, vs_fair=2.0)
+        # 条件1・4はこの est_now で通過することを個別に確認
+        assert _is_promising({"resale_score": 65, "asking_vs_fair_pct": 2.0}) is False  # 条件1: 満たす
+        assert 2.0 > 0                                                                    # 条件4: 満たす
+
+        result = find_sashine_candidate(candidate, curve, 2026, 10, 100, est_now)
+        assert result is not None
+        # est_at_target のスコアは est_now の65点ではなく、candidate の
+        # 実属性から computed された90点になっている
+        assert result["est_at_target"].resale_score == 90
+
+
+# ---------------------------------------------------------------------------
+# STEP3-4. 全条件を満たすケースで正しい dict が返ること
+# ---------------------------------------------------------------------------
+
+class TestFindSashineCandidateSuccess:
+
+    def test_all_conditions_pass_returns_correct_dict(self, candidate, curve):
+        # candidate(5500万・score90・vs_fair+9.13%) は非有望かつ割高。
+        # age_days=45(standard) の落としどころ(5115万)なら vs_fair+1.49%で
+        # 有望になるため、全条件を満たし正しい dict が返る
+        est_now = estimate_resale(candidate, curve, 2026, 10)
+        result = find_sashine_candidate(candidate, curve, 2026, 10, 45, est_now)
+
+        assert result is not None
+        assert set(result.keys()) == {"aggressiveness", "targets", "est_at_target"}
+        assert result["aggressiveness"] == "standard"
+        assert result["targets"]["target_price"] == 51_150_000
+        assert result["est_at_target"].asking_vs_fair_pct == pytest.approx(1.488095, abs=1e-4)
+        assert result["est_at_target"].resale_score == 90
+
+    def test_aggressiveness_in_result_matches_determine_aggressiveness(self, candidate, curve):
+        # age_days=90(aggressive) でも同様に正しい dict が返り、
+        # aggressiveness フィールドが determine_aggressiveness と一致すること
+        est_now = estimate_resale(candidate, curve, 2026, 10)
+        result = find_sashine_candidate(candidate, curve, 2026, 10, 90, est_now)
+
+        assert result is not None
+        assert result["aggressiveness"] == determine_aggressiveness(90) == "aggressive"
+        assert result["targets"]["target_price"] == 49_500_000
+        assert result["est_at_target"].asking_vs_fair_pct == pytest.approx(-1.785714, abs=1e-4)
+
+    def test_mild_can_yield_zero_discount_and_fail_to_qualify(self, candidate, curve):
+        """
+        STEP1×STEP3の相互作用の記録用テスト。candidate の asking_price
+        (5,500万円)はちょうど10万円単位のため、mild（10万円単位切り捨て）
+        では値引きがゼロになる（STEP1で確認済みの仕様）。この物件は
+        乖離率+9.13%と大きいため、値引きゼロでは有望化せず、
+        age_days=15（mild）では候補にならない。
+        """
+        est_now = estimate_resale(candidate, curve, 2026, 10)
+        result = find_sashine_candidate(candidate, curve, 2026, 10, 15, est_now)
+        assert determine_aggressiveness(15) == "mild"
+        assert result is None
