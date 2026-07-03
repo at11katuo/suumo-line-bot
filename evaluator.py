@@ -210,7 +210,7 @@ def resolve_city_code(location: str) -> Optional[str]:
 def evaluate_and_save(
     listings: list[Listing],
     city_code: str,
-    db_path: Path = DB_PATH,
+    db_path: Optional[Path] = None,
     hold_years: int = DEFAULT_HOLD_YEARS,
     current_year: Optional[int] = None,
     _evaluated_date: Optional[str] = None,
@@ -222,7 +222,10 @@ def evaluate_and_save(
     引数:
         listings        : SUUMO収集結果（scrape() や apply_filters() の出力）
         city_code       : 評価に使うエリアの市区町村コード（例: "13208"=調布市）
-        db_path         : SQLite ファイルのパス（デフォルト: DB_PATH）
+        db_path         : SQLite ファイルのパス。None なら呼び出し時点の DB_PATH を使う
+                          （関数定義時に固定値へ束縛されるのを避けるため、本体側で
+                          解決する。テストで evaluator.DB_PATH を monkeypatch した
+                          場合にも正しく反映される）
         hold_years      : 想定保有年数（デフォルト: DEFAULT_HOLD_YEARS=10年）
         current_year    : 評価基準年（None のとき今年を使う）
         _evaluated_date : テスト用。"YYYY-MM-DD" を渡すと今日の日付の代わりに使われる
@@ -237,6 +240,8 @@ def evaluate_and_save(
         - suumo_to_candidate() が None を返した物件（価格未定など）
         - エリアの減価カーブが取得できなかった場合（全件スキップ）
     """
+    if db_path is None:
+        db_path = DB_PATH
     year  = current_year or date.today().year
     today = _evaluated_date or date.today().isoformat()
     now   = datetime.now().isoformat(timespec="seconds")
@@ -292,7 +297,7 @@ def evaluate_and_save(
 
 def load_evaluations_today(
     urls: list[str],
-    db_path: Path = DB_PATH,
+    db_path: Optional[Path] = None,
     _today: Optional[str] = None,
 ) -> dict[str, dict]:
     """
@@ -301,9 +306,11 @@ def load_evaluations_today(
 
     引数:
         urls   : 評価結果を引きたい物件URLのリスト
-        db_path: SQLite ファイルのパス（デフォルト: DB_PATH）
+        db_path: SQLite ファイルのパス。None なら呼び出し時点の DB_PATH を使う
         _today : テスト用。"YYYY-MM-DD" を渡すと今日の代わりに使われる
     """
+    if db_path is None:
+        db_path = DB_PATH
     today = _today or date.today().isoformat()
     if not urls or not db_path.exists():
         return {}
@@ -335,7 +342,7 @@ def load_evaluations_today(
 
 def detect_changes(
     urls: list[str],
-    db_path: Path = DB_PATH,
+    db_path: Optional[Path] = None,
     _today: Optional[str] = None,
     min_price_drop: int = PRICE_DROP_THRESHOLD,
     min_score_gain: int = SCORE_GAIN_THRESHOLD,
@@ -362,11 +369,13 @@ def detect_changes(
 
     引数:
         urls          : 比較対象の物件 URL リスト
-        db_path       : SQLite ファイルのパス
+        db_path       : SQLite ファイルのパス。None なら呼び出し時点の DB_PATH を使う
         _today        : テスト用。"YYYY-MM-DD" を渡すと今日の代わりに使われる
         min_price_drop: 通知する価格下落の下限（円）
         min_score_gain: 通知するスコア改善の下限（点）
     """
+    if db_path is None:
+        db_path = DB_PATH
     today = _today or date.today().isoformat()
     if not urls or not db_path.exists():
         return []
@@ -434,7 +443,7 @@ def detect_changes(
 
 def get_listing_age_days(
     url: str,
-    db_path: Path = DB_PATH,
+    db_path: Optional[Path] = None,
     _today: Optional[str] = None,
 ) -> Optional[int]:
     """
@@ -453,9 +462,11 @@ def get_listing_age_days(
 
     引数:
         url    : 対象物件の URL
-        db_path: SQLite ファイルのパス
+        db_path: SQLite ファイルのパス。None なら呼び出し時点の DB_PATH を使う
         _today : テスト用。"YYYY-MM-DD" を渡すと today の代わりに使われる
     """
+    if db_path is None:
+        db_path = DB_PATH
     today_str = _today or date.today().isoformat()
     if not db_path.exists():
         return None
@@ -487,6 +498,99 @@ def get_listing_age_days(
     delta = (today_date - first_date).days
     # 念のため負値（未来日付が混入した場合）は 0 に丸める
     return delta if delta >= 0 else 0
+
+
+# ---------------------------------------------------------------------------
+# 指値候補の重複通知抑制（STEP4）
+# ---------------------------------------------------------------------------
+#
+# 「指値候補として通知したことがあるか、そのときの強気度は何だったか」を
+# 記録する専用テーブル。evaluations / detail_cache とは独立した追加であり、
+# 既存テーブル・既存カラムには一切触れない。
+#
+# 抑制方針: 同じ強気度（aggressive/standard/mild）のままなら再通知しない。
+# 強気度が変わった（例: standard→aggressive に強まった）ときだけ、
+# 新しい交渉の目安として再通知する。値下げ検知(detect_changes)と同じ
+# 「意味のある変化のときだけ通知する」という設計思想に合わせている。
+
+def _init_sashine_table(conn: sqlite3.Connection) -> None:
+    """sashine_notifications テーブルを作る（すでにあれば何もしない）。"""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sashine_notifications (
+            listing_url    TEXT PRIMARY KEY,  -- 物件の一意キー（SUUMOのURL）
+            aggressiveness TEXT    NOT NULL,  -- 最後に通知したときの強気度
+            notified_date  TEXT    NOT NULL   -- 最後に通知した日（"YYYY-MM-DD"）
+        )
+    """)
+    conn.commit()
+
+
+def get_sashine_notified_aggressiveness(
+    url: str,
+    db_path: Optional[Path] = None,
+) -> Optional[str]:
+    """
+    指定 URL を過去に指値候補として通知したときの強気度を返す。
+    一度も通知していない・DB未作成・例外のときは None を返す（例外は出さない）。
+
+    db_path: None なら呼び出し時点の DB_PATH を使う。
+    """
+    if db_path is None:
+        db_path = DB_PATH
+    if not db_path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            _init_sashine_table(conn)
+            row = conn.execute(
+                "SELECT aggressiveness FROM sashine_notifications WHERE listing_url = ?",
+                (url,),
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    return row[0] if row else None
+
+
+def mark_sashine_notified(
+    url: str,
+    aggressiveness: str,
+    db_path: Optional[Path] = None,
+    _today: Optional[str] = None,
+) -> None:
+    """
+    指値候補として通知したことを記録する（UPSERT）。
+    同じ URL に対して二回目以降は aggressiveness・notified_date を上書きする
+    （＝常に「最後に通知したときの強気度」を保持する）。
+    DB書き込みに失敗しても例外は投げない（通知自体は既に送信済みのため、
+    記録の失敗だけで処理全体を止める必要はない）。
+
+    db_path: None なら呼び出し時点の DB_PATH を使う。
+    """
+    if db_path is None:
+        db_path = DB_PATH
+    today = _today or date.today().isoformat()
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            _init_sashine_table(conn)
+            conn.execute(
+                """
+                INSERT INTO sashine_notifications (listing_url, aggressiveness, notified_date)
+                VALUES (?, ?, ?)
+                ON CONFLICT(listing_url) DO UPDATE SET
+                    aggressiveness = excluded.aggressiveness,
+                    notified_date  = excluded.notified_date
+                """,
+                (url, aggressiveness, today),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        logger.warning("mark_sashine_notified 失敗（通知は既に送信済み）: %s", e)
 
 
 # ---------------------------------------------------------------------------

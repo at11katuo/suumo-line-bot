@@ -21,7 +21,13 @@ import pytest
 
 import build_curves
 import evaluator
-from evaluator import DEFAULT_HOLD_YEARS, evaluate_and_save, get_listing_age_days
+from evaluator import (
+    DEFAULT_HOLD_YEARS,
+    evaluate_and_save,
+    get_listing_age_days,
+    get_sashine_notified_aggressiveness,
+    mark_sashine_notified,
+)
 from scraper import Listing
 
 # ---------------------------------------------------------------------------
@@ -336,3 +342,69 @@ class TestListingAgeDays:
         age = get_listing_age_days(self.URL, db_path=tmp_path / "no.db",
                                    _today="2026-01-25")
         assert age is None
+
+
+# ---------------------------------------------------------------------------
+# 5. 指値候補の重複通知抑制（sashine_notifications テーブル。STEP4）
+# ---------------------------------------------------------------------------
+
+class TestSashineNotifications:
+    """
+    get_sashine_notified_aggressiveness / mark_sashine_notified の仕様検証。
+    「同じ強気度なら再通知しない、強気度が変わったら再通知する」という
+    抑制ロジックの土台となるテーブルなので、ここを厳密に固定する。
+    """
+
+    URL = "https://suumo.jp/test/sashine-1/"
+
+    def test_never_notified_returns_none(self, db_path):
+        # 一度も通知していない URL は None（初回として扱われる）
+        assert get_sashine_notified_aggressiveness(self.URL, db_path=db_path) is None
+
+    def test_missing_db_returns_none(self, tmp_path):
+        # DB ファイル自体が存在しない場合も None（落ちない）
+        result = get_sashine_notified_aggressiveness(self.URL, db_path=tmp_path / "no.db")
+        assert result is None
+
+    def test_mark_then_get_returns_same_aggressiveness(self, db_path):
+        # 通知を記録した直後は、その強気度がそのまま返ること
+        mark_sashine_notified(self.URL, "standard", db_path=db_path, _today="2026-01-10")
+        assert get_sashine_notified_aggressiveness(self.URL, db_path=db_path) == "standard"
+
+    def test_mark_twice_same_aggressiveness_overwrites_date_not_value(self, db_path):
+        # 同じ強気度で2回記録しても、値は同じまま（UPSERTで上書き）
+        mark_sashine_notified(self.URL, "mild", db_path=db_path, _today="2026-01-10")
+        mark_sashine_notified(self.URL, "mild", db_path=db_path, _today="2026-01-20")
+        assert get_sashine_notified_aggressiveness(self.URL, db_path=db_path) == "mild"
+
+    def test_mark_escalation_updates_to_new_aggressiveness(self, db_path):
+        # 強気度が上がったとき（mild→standard→aggressive）、記録が更新されること
+        mark_sashine_notified(self.URL, "mild", db_path=db_path, _today="2026-01-10")
+        mark_sashine_notified(self.URL, "standard", db_path=db_path, _today="2026-02-10")
+        assert get_sashine_notified_aggressiveness(self.URL, db_path=db_path) == "standard"
+
+        mark_sashine_notified(self.URL, "aggressive", db_path=db_path, _today="2026-03-10")
+        assert get_sashine_notified_aggressiveness(self.URL, db_path=db_path) == "aggressive"
+
+    def test_different_urls_tracked_independently(self, db_path):
+        # URL ごとに別々に記録されること（他物件の記録に影響しない）
+        url_a = "https://suumo.jp/test/sashine-a/"
+        url_b = "https://suumo.jp/test/sashine-b/"
+        mark_sashine_notified(url_a, "aggressive", db_path=db_path, _today="2026-01-10")
+        mark_sashine_notified(url_b, "mild", db_path=db_path, _today="2026-01-10")
+        assert get_sashine_notified_aggressiveness(url_a, db_path=db_path) == "aggressive"
+        assert get_sashine_notified_aggressiveness(url_b, db_path=db_path) == "mild"
+
+    def test_does_not_touch_evaluations_table(self, db_path):
+        # sashine_notifications は evaluations テーブルとは独立した追加
+        # であることの確認（既存データ・既存件数に影響しない）
+        evaluate_and_save([make_listing()], CHOFU_CODE, db_path=db_path,
+                          _evaluated_date="2026-01-10")
+        assert _count_rows(db_path) == 1
+
+        mark_sashine_notified(self.URL, "standard", db_path=db_path, _today="2026-01-10")
+
+        # evaluations テーブルの件数は変わらない
+        assert _count_rows(db_path) == 1
+        # sashine_notifications 側は正しく記録されている
+        assert get_sashine_notified_aggressiveness(self.URL, db_path=db_path) == "standard"

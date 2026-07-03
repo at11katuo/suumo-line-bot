@@ -800,6 +800,189 @@ def notify_line_reference(
 
 
 # ------------------------------------------------------------------ #
+# 指値候補通知（独立した第4カテゴリ。sashine.py の STEP1〜3を組み合わせるだけ）
+#   ※ 新しい計算式・しきい値はここでは作らない。sashine.find_sashine_candidate
+#      の判定結果をそのまま使う。
+# ------------------------------------------------------------------ #
+
+_SASHINE_HEADER = (
+    "💰 指値候補（現在は割高、指値なら有望域）\n"
+    "※あくまで交渉の目安です。売主の事情により通らないこともあります。\n"
+    "※日数はbot確認開始からの目安で、実際の掲載期間はより長い可能性があります"
+)
+
+_AGGRESSIVENESS_LABELS = {"aggressive": "強気", "standard": "標準", "mild": "控えめ"}
+
+
+def _build_text_sashine(
+    listing: Listing,
+    found: dict,
+    est_now,          # reinfolib_resale.ResaleEstimate（現在の売出価格での評価）
+    age_days: Optional[int],
+    idx: int,
+) -> str:
+    """指値候補1件分のメッセージを組み立てる。"""
+    targets       = found["targets"]
+    est_at_target = found["est_at_target"]
+    agg_label     = _AGGRESSIVENESS_LABELS.get(found["aggressiveness"], found["aggressiveness"])
+
+    vs_fair_now = est_now.asking_vs_fair_pct
+    if vs_fair_now is not None:
+        now_direction = "割安" if vs_fair_now <= 0 else "割高"
+        now_vs_str = f"（乖離率 {vs_fair_now:+.1f}%・{now_direction}）"
+    else:
+        now_vs_str = ""
+
+    parts = [f"【{idx}】{listing.name}", f"  売出価格 : {listing.price}{now_vs_str}"]
+
+    age_line = _format_listing_age(age_days)
+    if age_line:
+        parts.append(f"  {age_line} → 強気度: {agg_label}")
+    else:
+        parts.append(f"  強気度: {agg_label}")
+
+    parts.append("  --- 指値目安 ---")
+    opening_man = targets["opening_offer"]   / 10_000
+    target_man  = targets["target_price"]    / 10_000
+    walk_man    = targets["walk_away_price"] / 10_000
+
+    vs_fair_target = est_at_target.asking_vs_fair_pct
+    target_vs_str = f"（指値後の乖離率 {vs_fair_target:+.1f}%・有望域）" if vs_fair_target is not None else ""
+
+    parts.append(f"  初回提示    : {opening_man:.0f}万円")
+    parts.append(f"  落としどころ : {target_man:.0f}万円{target_vs_str}")
+    parts.append(f"  引き際      : {walk_man:.0f}万円")
+    parts.append(f"  URL : {listing.url}")
+    return "\n".join(parts)
+
+
+def _find_sashine_candidates(
+    city_groups: dict[str, list],
+    detail_cache: Optional[dict],
+    db_path=None,
+) -> list[tuple]:
+    """
+    city_groups（市コード→Listingリスト）の全物件から指値候補を探す。
+
+    evaluate_and_save と同じ手順（get_curve → suumo_to_candidate →
+    estimate_resale）をもう一度実行して est_now を得る。sashine.py は
+    DB行の形（dict）を一切知らない設計のため、DBから復元するのではなく
+    ResaleEstimate をここで直接計算し直す（curve はファイルキャッシュ済み
+    のため、再計算のコストは無視できるレベル）。
+
+    重複抑制: 同じ強気度で既に通知済み（sashine_notifications テーブル）
+    ならスキップする。強気度が変わったとき（例: standard→aggressive）
+    だけ再通知の対象にする。
+
+    例外はここでは捕まえない。呼び出し側 main() の try/except に
+    隔離を任せる（指値候補判定の失敗が既存の通知を止めないようにするため）。
+
+    引数:
+        db_path: テスト用。None のとき（本番の呼び出し方）は
+                 evaluator.DB_PATH（本番の evaluations.db）を使う。
+                 evaluator.get_listing_age_days 等は db_path 引数が
+                 「関数定義時に束縛されるデフォルト値」のため、テストで
+                 一時DBに差し替えるにはここで明示的に db_path を
+                 渡す必要がある（呼び出し側で上書きしないと本番DBに
+                 書き込んでしまうため）。
+
+    戻り値: [(Listing, found_dict, est_now, age_days), ...]
+        found_dict は sashine.find_sashine_candidate の戻り値
+        （aggressiveness / targets / est_at_target を含む）。
+    """
+    from datetime import date
+
+    from build_curves import TARGET_AREAS, get_curve
+    from evaluator import DB_PATH as _EVALUATOR_DB_PATH
+    from evaluator import (
+        DEFAULT_HOLD_YEARS,
+        get_listing_age_days,
+        get_sashine_notified_aggressiveness,
+        mark_sashine_notified,
+    )
+    from reinfolib_resale import estimate_resale
+    from sashine import find_sashine_candidate
+    from suumo_adapter import suumo_to_candidate
+
+    effective_db_path = db_path if db_path is not None else _EVALUATOR_DB_PATH
+
+    code_to_name = {code: name for name, code in TARGET_AREAS.items()}
+    year = date.today().year
+
+    results: list[tuple] = []
+    for city_code, listings_for_city in city_groups.items():
+        city_name = code_to_name.get(city_code, city_code)
+        curve = get_curve(city_name=city_name, city_code=city_code)
+        if curve is None:
+            continue  # カーブ取得不可のエリアはスキップ（evaluate_and_saveと同じ扱い）
+
+        for listing in listings_for_city:
+            candidate = suumo_to_candidate(
+                listing,
+                detail=detail_cache.get(listing.url) if detail_cache else None,
+            )
+            if candidate is None:
+                continue
+
+            est_now  = estimate_resale(candidate, curve, year, DEFAULT_HOLD_YEARS)
+            age_days = get_listing_age_days(listing.url, db_path=effective_db_path)
+
+            found = find_sashine_candidate(
+                candidate, curve, year, DEFAULT_HOLD_YEARS, age_days, est_now
+            )
+            if found is None:
+                continue
+
+            # 重複抑制: 同じ強気度で既に通知済みならスキップする
+            prev_aggressiveness = get_sashine_notified_aggressiveness(
+                listing.url, db_path=effective_db_path
+            )
+            if prev_aggressiveness == found["aggressiveness"]:
+                continue
+
+            results.append((listing, found, est_now, age_days))
+            mark_sashine_notified(listing.url, found["aggressiveness"], db_path=effective_db_path)
+
+    return results
+
+
+def notify_line_sashine_candidates(candidates: list[tuple]) -> None:
+    """
+    指値候補通知（独立した第4カテゴリ）。
+    _find_sashine_candidates が返した候補（重複抑制フィルタ通過済み）を
+    まとめて通知する。該当0件なら何も送信しない。
+    """
+    if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_USER_ID:
+        print("[警告] LINE 認証情報が未設定のため指値候補通知をスキップします。", flush=True)
+        return
+    if not candidates:
+        print("指値候補（AI評価とは独立の第4カテゴリ）の該当はありませんでした。", flush=True)
+        return
+
+    message_texts: list[str] = [_SASHINE_HEADER]
+    blocks = [
+        _build_text_sashine(listing, found, est_now, age_days, i + 1)
+        for i, (listing, found, est_now, age_days) in enumerate(candidates)
+    ]
+    for i in range(0, len(blocks), _COMPACT_PER_MESSAGE):
+        message_texts.append("\n\n".join(blocks[i : i + _COMPACT_PER_MESSAGE]))
+
+    headers = {
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    for batch_start in range(0, len(message_texts), _MAX_MESSAGES_PER_CALL):
+        batch = message_texts[batch_start : batch_start + _MAX_MESSAGES_PER_CALL]
+        payload = {
+            "to": LINE_USER_ID,
+            "messages": [{"type": "text", "text": t} for t in batch],
+        }
+        resp = requests.post(LINE_API_URL, headers=headers, json=payload, timeout=10)
+        print(f"LINE送信結果（指値候補）: {resp.status_code} - {resp.text}", flush=True)
+        time.sleep(1)
+
+
+# ------------------------------------------------------------------ #
 # エントリポイント
 # ------------------------------------------------------------------ #
 def main() -> None:
@@ -830,6 +1013,7 @@ def main() -> None:
     # ・例外が出ても後続の通知（2段階・価格変動とも）に影響しない。
     price_drop_alerts: list[dict] = []
     est_map: dict[str, dict] = {}
+    sashine_candidates: list[tuple] = []  # 指値候補（第4カテゴリ）。失敗時は空のまま
     try:
         from evaluator import evaluate_and_save, load_evaluations_today, detect_changes, resolve_city_code  # 循環インポート回避
         from detail_fetcher import fetch_detail, load_detail_cache, save_detail_cache, get_uncached_urls  # 循環インポート回避
@@ -866,6 +1050,16 @@ def main() -> None:
             evaluate_and_save(listings_for_city, city_code=city_code, detail_cache=detail_cache)
         print(f"市コード判定不可でスキップ: {skipped_city}件", flush=True)
 
+        # ── 指値候補の判定（第4カテゴリ。current全件が対象）─────────────
+        # 既存の評価パイプラインとは別に専用のtry/exceptで隔離する。
+        # ここで例外が起きても、直後の値下げ検知や、この後の全ての
+        # 通知（値下げ・2段階・参考枠）には一切影響しない。
+        try:
+            sashine_candidates = _find_sashine_candidates(city_groups, detail_cache)
+        except Exception as e:
+            print(f"[警告] 指値候補判定に失敗（既存の通知は継続）: {e}", flush=True)
+            sashine_candidates = []
+
         price_drop_alerts = detect_changes([l.url for l in current])
         # est_map は新着物件の2段階通知用にのみ使うため new_listings のURLに絞る
         est_map = load_evaluations_today([l.url for l in new_listings])
@@ -877,6 +1071,10 @@ def main() -> None:
         notify_line_price_drops(price_drop_alerts)
     else:
         print("価格変動のある物件はありませんでした。", flush=True)
+
+    # 指値候補通知（第4カテゴリ。current全件が対象のため new_listings の
+    # 有無に関わらずここで送る。該当0件なら内部で何も送信しない）
+    notify_line_sashine_candidates(sashine_candidates)
 
     if not new_listings:
         print("新着物件はありませんでした。", flush=True)

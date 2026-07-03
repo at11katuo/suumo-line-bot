@@ -170,13 +170,17 @@ def _init_detail_table(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def save_detail_cache(url: str, data: dict, db_path: Path = DB_PATH) -> None:
+def save_detail_cache(url: str, data: dict, db_path: Optional[Path] = None) -> None:
     """
     取得した詳細データを detail_cache テーブルに保存する（INSERT OR REPLACE）。
 
     取得失敗時（data = {"total_units": None, "repair_fund_monthly": None}）も
     保存することで「試み済み」のフラグとなり、次回実行での重複 fetch を防ぐ。
+
+    db_path: None なら呼び出し時点の DB_PATH を使う。
     """
+    if db_path is None:
+        db_path = DB_PATH
     now = datetime.now().isoformat(timespec="seconds")
     conn = sqlite3.connect(db_path)
     try:
@@ -194,14 +198,18 @@ def save_detail_cache(url: str, data: dict, db_path: Path = DB_PATH) -> None:
         conn.close()
 
 
-def load_detail_cache(urls: list[str], db_path: Path = DB_PATH) -> dict[str, dict]:
+def load_detail_cache(urls: list[str], db_path: Optional[Path] = None) -> dict[str, dict]:
     """
     detail_cache テーブルから指定 URL 群のキャッシュを一括取得する。
 
     戻り値:
         {url: {"total_units": int|None, "repair_fund_monthly": float|None}}
         DB が存在しない・テーブル未作成・例外時は空 dict（例外を出さない）。
+
+    db_path: None なら呼び出し時点の DB_PATH を使う。
     """
+    if db_path is None:
+        db_path = DB_PATH
     if not urls or not db_path.exists():
         return {}
 
@@ -230,14 +238,18 @@ def load_detail_cache(urls: list[str], db_path: Path = DB_PATH) -> dict[str, dic
     return result
 
 
-def get_uncached_urls(urls: list[str], db_path: Path = DB_PATH) -> list[str]:
+def get_uncached_urls(urls: list[str], db_path: Optional[Path] = None) -> list[str]:
     """
     detail_cache テーブルに「一度も登録されていない」URL のみを返す。
     登録済み（取得失敗で NULL の場合も含む）はスキップ対象。
 
     これにより「新着物件のうち未取得の物件だけ」fetch できる。
     取得失敗（NULL）の物件は再 fetch しない（transient エラーのリトライは行わない）。
+
+    db_path: None なら呼び出し時点の DB_PATH を使う。
     """
+    if db_path is None:
+        db_path = DB_PATH
     if not urls:
         return []
     if not db_path.exists():
