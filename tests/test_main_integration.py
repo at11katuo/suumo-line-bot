@@ -43,6 +43,7 @@ import pytest
 import build_curves
 import detail_fetcher
 import evaluator
+import gemini_cache
 import scraper
 from reinfolib_resale import DepreciationCurve
 from scraper import Listing
@@ -93,10 +94,17 @@ def main_env(tmp_path, monkeypatch):
       両方。理由はファイル冒頭のdocstring参照）
     - LINE認証情報を注入
     - scrape/詳細取得/Gemini/sleep を外部通信ゼロになるようモック
+
+    ⚠ gemini_cache.DB_PATH も必ず差し替えること。main() の Gemini評価
+      ループが save_gemini_evaluation を呼ぶようになったため、これを
+      忘れると本番の evaluations.db に書き込んでしまう
+      （実際に一度この漏れで本番DBに test/main-* という偽URLが
+      書き込まれる事故が起きたため、二度と忘れないようここに明記する）。
     """
     db_path = tmp_path / "evaluations.db"
     monkeypatch.setattr(evaluator, "DB_PATH", db_path)
     monkeypatch.setattr(detail_fetcher, "DB_PATH", db_path)
+    monkeypatch.setattr(gemini_cache, "DB_PATH", db_path)
     monkeypatch.setattr(build_curves, "CACHE_DIR", tmp_path / "cache")
     monkeypatch.setenv("USE_MOCK_REINFOLIB", "1")
 

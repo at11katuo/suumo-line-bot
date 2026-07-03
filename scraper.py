@@ -799,6 +799,66 @@ def notify_line_reference(
         time.sleep(1)
 
 
+def _find_reference_candidates(
+    rejected: list[tuple[Listing, int, str]],
+    est_map: dict[str, dict],
+    db_path=None,
+) -> list[tuple[Listing, int, str]]:
+    """
+    rejected のうち reinfolib 有望かつ「まだ参考枠で通知していない」ものだけを返す。
+
+    【背景】
+        従来、参考枠（notify_line_reference）は new_listings（新着）だけを
+        対象にしていたため、一度 Gemini に4★未満をつけられた既知物件は、
+        その後 reinfolib 評価がどれだけ改善しても二度と参考枠に浮上
+        できなかった（実際に調布市の物件で確認された欠陥）。
+        この関数は、新着分だけでなく既知物件分（gemini_cache に保存済みの
+        Gemini評価と組み合わせたもの）も含めた rejected を受け取り、
+        reinfolib 有望フィルタと重複抑制を行った上で、実際に通知すべき
+        ものだけに絞り込む。
+
+    重複抑制:
+        一度でも参考枠として通知した URL は、以後ずっと抑制する
+        （有望/非有望の二値判定であり、指値候補の強気度のような
+        段階的な指標がないための単純な方式）。
+
+    notify_line_reference 自体は変更しない。この関数は notify_line_reference
+    を呼ぶ「前」に候補を絞り込む事前フィルタとして機能する
+    （notify_line_reference は渡された rejected に対して同じ
+    _is_promising フィルタを内部でも行うため、二重フィルタになるが
+    害はない。既存の notify_line_reference のテスト・契約を一切
+    変更しないためにこの設計にしている）。
+
+    引数:
+        rejected: (listing, gemini★, eval_text) のリスト。新着分(new_rejected)
+                  と既知物件分(known_rejected)を呼び出し側で結合して渡す想定。
+        est_map : 物件URL → reinfolib 評価結果（current 全件をカバーしている
+                  必要がある。new_listings だけに絞ったものを渡すと既知物件が
+                  必ず非有望judgeになってしまうので注意）。
+        db_path : テスト用。None なら evaluator.DB_PATH を使う。
+
+    戻り値:
+        通知すべき (listing, gemini★, eval_text) のリスト。
+        該当0件なら空リスト（例外は投げない）。
+    """
+    from evaluator import is_reference_notified, mark_reference_notified
+
+    targets = [
+        (listing, gemini_score, eval_text)
+        for listing, gemini_score, eval_text in rejected
+        if _is_promising(est_map.get(listing.url, {}))
+    ]
+
+    result: list[tuple[Listing, int, str]] = []
+    for listing, gemini_score, eval_text in targets:
+        if is_reference_notified(listing.url, db_path=db_path):
+            continue  # 既に参考枠で通知済み → 再通知しない
+        result.append((listing, gemini_score, eval_text))
+        mark_reference_notified(listing.url, db_path=db_path)
+
+    return result
+
+
 # ------------------------------------------------------------------ #
 # 指値候補通知（独立した第4カテゴリ。sashine.py の STEP1〜3を組み合わせるだけ）
 #   ※ 新しい計算式・しきい値はここでは作らない。sashine.find_sashine_candidate
@@ -1061,8 +1121,10 @@ def main() -> None:
             sashine_candidates = []
 
         price_drop_alerts = detect_changes([l.url for l in current])
-        # est_map は新着物件の2段階通知用にのみ使うため new_listings のURLに絞る
-        est_map = load_evaluations_today([l.url for l in new_listings])
+        # est_map は参考枠（既知物件を含む）でも使うため current 全件に拡大する。
+        # notify_line_two_stage は scored（new_listings由来のみ）しか参照しない
+        # ため、この拡大は既存の2段階通知の挙動に影響しない。
+        est_map = load_evaluations_today([l.url for l in current])
     except Exception as e:
         print(f"[警告] 評価パイプライン失敗（通知は継続）: {e}", flush=True)
 
@@ -1076,36 +1138,68 @@ def main() -> None:
     # 有無に関わらずここで送る。該当0件なら内部で何も送信しない）
     notify_line_sashine_candidates(sashine_candidates)
 
-    if not new_listings:
+    # ── Gemini評価: 新着のみ（現状維持。API呼び出し回数を増やさない）──────────
+    scored:       list[tuple[Listing, str]]      = []
+    new_rejected: list[tuple[Listing, int, str]] = []  # (listing, gemini★, eval_text)
+    if new_listings:
+        print(f"Gemini で {len(new_listings)} 件を評価中...", flush=True)
+        from gemini_cache import save_gemini_evaluation  # 循環インポート回避
+
+        for listing in new_listings:
+            score, eval_text = evaluate_listing(listing)
+            # 初回評価時のみ保存。以後この物件が既知物件になっても、この
+            # 保存済みスコアを参考枠判定に再利用する（Gemini APIは呼ばない）。
+            try:
+                save_gemini_evaluation(listing.url, score, eval_text)
+            except Exception as e:
+                print(f"[警告] Gemini評価の保存に失敗（評価自体は継続）: {e}", flush=True)
+            if score >= 4:
+                scored.append((listing, eval_text))
+            else:
+                # 4★未満は従来は捨てていた。参考枠判定のため (物件, ★数, 評価文) を保持する。
+                new_rejected.append((listing, score, eval_text))
+            time.sleep(15)  # Gemini API TPM制限対策（無料枠: 429回避）
+
+        skipped = len(new_listings) - len(scored)
+        print(f"4★以上: {len(scored)} 件 / 3★以下スキップ: {skipped} 件", flush=True)
+
+        if scored:
+            notify_line_two_stage(scored, est_map)
+        else:
+            print("通知対象（4★以上）の物件はありませんでした。", flush=True)
+    else:
         print("新着物件はありませんでした。", flush=True)
+
+    # ── 参考枠（第3カテゴリ。current全件が対象。new_listingsの有無に関わらず実行）──
+    # 新着分(new_rejected) + 既知物件分（gemini_cache に保存済みの Gemini評価が
+    # 4★未満のもの）を結合し、reinfolib有望フィルタ・重複抑制を通してから通知する。
+    # これにより「新着時にGeminiに低評価をつけられた既知物件が、その後
+    # reinfolib評価が改善しても二度と参考枠に出ない」という欠陥を解消する。
+    # 専用try/exceptで隔離: ここが失敗しても新着分だけで参考枠を継続させる
+    # （既存の新着ベースの参考枠を道連れにしない）。
+    try:
+        from gemini_cache import load_gemini_evaluations  # 循環インポート回避
+
+        new_listing_urls_set = {l.url for l in new_listings}
+        known_listings = [l for l in current if l.url not in new_listing_urls_set]
+        known_gemini   = load_gemini_evaluations([l.url for l in known_listings])
+        known_rejected = [
+            (listing, known_gemini[listing.url][0], known_gemini[listing.url][1])
+            for listing in known_listings
+            if listing.url in known_gemini and known_gemini[listing.url][0] < 4
+        ]
+        all_rejected = new_rejected + known_rejected
+        reference_candidates = _find_reference_candidates(all_rejected, est_map)
+    except Exception as e:
+        print(f"[警告] 参考枠の対象抽出に失敗（新着分のみで継続）: {e}", flush=True)
+        reference_candidates = new_rejected
+
+    # 参考枠通知。該当0件なら内部で何も送らない。既存の2段階通知には一切影響しない。
+    notify_line_reference(reference_candidates, est_map)
+
+    if not new_listings:
         print("=== 完了 ===", flush=True)
         return
-
-    # Gemini で評価 → 4〜5★のみ抽出
-    print(f"Gemini で {len(new_listings)} 件を評価中...", flush=True)
-    scored:   list[tuple[Listing, str]]      = []
-    rejected: list[tuple[Listing, int, str]] = []  # (listing, gemini★, eval_text)
-    for listing in new_listings:
-        score, eval_text = evaluate_listing(listing)
-        if score >= 4:
-            scored.append((listing, eval_text))
-        else:
-            # 4★未満は従来は捨てていた。参考枠判定のため (物件, ★数, 評価文) を保持する。
-            rejected.append((listing, score, eval_text))
-        time.sleep(15)  # Gemini API TPM制限対策（無料枠: 429回避）
-
-    skipped = len(new_listings) - len(scored)
-    print(f"4★以上: {len(scored)} 件 / 3★以下スキップ: {skipped} 件", flush=True)
-
-    # LINE 通知（2段階）& CSV 保存（新着が1件でもあれば必ず保存）
-    if scored:
-        notify_line_two_stage(scored, est_map)
-    else:
-        print("通知対象（4★以上）の物件はありませんでした。", flush=True)
-
-    # 参考枠（独立した第3カテゴリ）: Gemini 4★未満だが reinfolib 有望な物件だけを通知。
-    # 該当0件なら内部で何も送らない。既存の2段階通知には一切影響しない。
-    notify_line_reference(rejected, est_map)
 
     save_listings(DATA_FILE, current)
     print("data.csv を更新しました。", flush=True)

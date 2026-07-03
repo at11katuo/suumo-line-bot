@@ -26,6 +26,8 @@ from evaluator import (
     evaluate_and_save,
     get_listing_age_days,
     get_sashine_notified_aggressiveness,
+    is_reference_notified,
+    mark_reference_notified,
     mark_sashine_notified,
 )
 from scraper import Listing
@@ -408,3 +410,57 @@ class TestSashineNotifications:
         assert _count_rows(db_path) == 1
         # sashine_notifications 側は正しく記録されている
         assert get_sashine_notified_aggressiveness(self.URL, db_path=db_path) == "standard"
+
+
+# ---------------------------------------------------------------------------
+# 6. 参考枠の重複通知抑制（reference_notifications テーブル）
+# ---------------------------------------------------------------------------
+
+class TestReferenceNotifications:
+    """
+    is_reference_notified / mark_reference_notified の仕様検証。
+    参考枠は有望/非有望の二値判定のため、sashine の強気度のような段階が
+    なく「一度通知したら以後ずっと抑制する」という単純な方式である。
+    """
+
+    URL = "https://suumo.jp/test/reference-1/"
+
+    def test_never_notified_returns_false(self, db_path):
+        assert is_reference_notified(self.URL, db_path=db_path) is False
+
+    def test_missing_db_returns_false(self, tmp_path):
+        result = is_reference_notified(self.URL, db_path=tmp_path / "no.db")
+        assert result is False
+
+    def test_mark_then_check_returns_true(self, db_path):
+        mark_reference_notified(self.URL, db_path=db_path, _today="2026-01-10")
+        assert is_reference_notified(self.URL, db_path=db_path) is True
+
+    def test_mark_twice_still_notified(self, db_path):
+        # 二回記録しても（同じURLの再通知が発生しても）通知済み状態は変わらない
+        mark_reference_notified(self.URL, db_path=db_path, _today="2026-01-10")
+        mark_reference_notified(self.URL, db_path=db_path, _today="2026-02-10")
+        assert is_reference_notified(self.URL, db_path=db_path) is True
+
+    def test_different_urls_tracked_independently(self, db_path):
+        url_a = "https://suumo.jp/test/reference-a/"
+        url_b = "https://suumo.jp/test/reference-b/"
+        mark_reference_notified(url_a, db_path=db_path, _today="2026-01-10")
+        assert is_reference_notified(url_a, db_path=db_path) is True
+        assert is_reference_notified(url_b, db_path=db_path) is False
+
+    def test_does_not_touch_evaluations_or_sashine_tables(self, db_path):
+        # reference_notifications は evaluations・sashine_notifications とは
+        # 独立した追加であることの確認
+        evaluate_and_save([make_listing()], CHOFU_CODE, db_path=db_path,
+                          _evaluated_date="2026-01-10")
+        mark_sashine_notified("https://suumo.jp/test/other/", "standard",
+                              db_path=db_path, _today="2026-01-10")
+
+        mark_reference_notified(self.URL, db_path=db_path, _today="2026-01-10")
+
+        assert _count_rows(db_path) == 1  # evaluations は変わらない
+        assert get_sashine_notified_aggressiveness(
+            "https://suumo.jp/test/other/", db_path=db_path
+        ) == "standard"  # sashine_notifications も変わらない
+        assert is_reference_notified(self.URL, db_path=db_path) is True

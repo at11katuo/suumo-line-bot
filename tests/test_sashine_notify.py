@@ -457,11 +457,16 @@ class TestMainSashineWiring:
         idx_sashine    = source.index("notify_line_sashine_candidates(sashine_candidates)")
         assert idx_price_drop < idx_sashine
 
-    def test_two_stage_and_reference_notify_still_present_after_gate(self):
-        # 新着がある日のみ実行される既存の通知が、コード上まだ存在すること
-        # （sashine追加によって誤って消されていないかの簡易確認）
+    def test_two_stage_and_reference_notify_still_present(self):
+        # 新着がある日に実行される既存の通知が、コード上まだ存在すること
+        # （sashine追加によって誤って消されていないかの簡易確認）。
+        #
+        # ※ 参考枠の既知物件対応（gemini_evaluations永続化）実装により、
+        #   notify_line_two_stage / notify_line_reference の呼び出しは
+        #   意図的に「if not new_listings:」より前に移動している
+        #   （参考枠を new_listings の有無に関わらず実行するため）。
+        #   このテストはその位置関係ではなく、呼び出し自体が存在することの
+        #   確認に絞る。
         source = inspect.getsource(scraper.main)
-        idx_gate = source.index("if not new_listings:")
-        remainder = source[idx_gate:]
-        assert "notify_line_two_stage(scored, est_map)" in remainder
-        assert "notify_line_reference(rejected, est_map)" in remainder
+        assert "notify_line_two_stage(scored, est_map)" in source
+        assert "notify_line_reference(reference_candidates, est_map)" in source

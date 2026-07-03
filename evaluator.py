@@ -594,6 +594,93 @@ def mark_sashine_notified(
 
 
 # ---------------------------------------------------------------------------
+# 参考枠の重複通知抑制（既知物件を対象に含めたことに伴う追加）
+# ---------------------------------------------------------------------------
+#
+# 「参考枠として一度でも通知したことがあるか」を記録する専用テーブル。
+# sashine_notifications と同じ設計思想だが、参考枠は有望/非有望の二値
+# 判定であり強気度のような段階的な指標がないため、抑制方式は
+# 「一度通知したら以後ずっと抑制する」というシンプルなものにしている
+# （一度非該当になった後に再度該当した場合の再通知は今回のスコープ外）。
+
+def _init_reference_table(conn: sqlite3.Connection) -> None:
+    """reference_notifications テーブルを作る（すでにあれば何もしない）。"""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS reference_notifications (
+            listing_url   TEXT PRIMARY KEY,  -- 物件の一意キー（SUUMOのURL）
+            notified_date TEXT NOT NULL      -- 通知した日（"YYYY-MM-DD"）
+        )
+    """)
+    conn.commit()
+
+
+def is_reference_notified(
+    url: str,
+    db_path: Optional[Path] = None,
+) -> bool:
+    """
+    指定 URL を過去に参考枠として通知したことがあるかを返す。
+    DB未作成・例外のときは False を返す（例外は出さない。
+    False＝未通知扱いにすることで、記録が読めない場合でも通知自体は
+    継続できる安全側の挙動にしている）。
+
+    db_path: None なら呼び出し時点の DB_PATH を使う。
+    """
+    if db_path is None:
+        db_path = DB_PATH
+    if not db_path.exists():
+        return False
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            _init_reference_table(conn)
+            row = conn.execute(
+                "SELECT 1 FROM reference_notifications WHERE listing_url = ?",
+                (url,),
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+    return row is not None
+
+
+def mark_reference_notified(
+    url: str,
+    db_path: Optional[Path] = None,
+    _today: Optional[str] = None,
+) -> None:
+    """
+    参考枠として通知したことを記録する（UPSERT）。
+    DB書き込みに失敗しても例外は投げない（通知自体は既に送信済みのため、
+    記録の失敗だけで処理全体を止める必要はない）。
+
+    db_path: None なら呼び出し時点の DB_PATH を使う。
+    """
+    if db_path is None:
+        db_path = DB_PATH
+    today = _today or date.today().isoformat()
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            _init_reference_table(conn)
+            conn.execute(
+                """
+                INSERT INTO reference_notifications (listing_url, notified_date)
+                VALUES (?, ?)
+                ON CONFLICT(listing_url) DO UPDATE SET
+                    notified_date = excluded.notified_date
+                """,
+                (url, today),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        logger.warning("mark_reference_notified 失敗（通知は既に送信済み）: %s", e)
+
+
+# ---------------------------------------------------------------------------
 # エントリポイント（手動実行・動作確認用）
 # ---------------------------------------------------------------------------
 
