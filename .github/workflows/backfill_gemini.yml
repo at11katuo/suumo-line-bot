@@ -1,0 +1,75 @@
+name: 【運用ツール・手動のみ】Gemini評価バックフィル
+
+# ============================================================
+# このワークフローの目的:
+#   参考枠は「gemini_evaluations に保存済みの既知物件」を対象にするが、
+#   gemini_cache.py 導入前からの既知物件は一度もGemini評価が保存
+#   されておらず、永久に参考枠の対象外になっている。
+#   このワークフローで、未保存分にだけ一度きりのGemini評価を実行し、
+#   gemini_evaluations に保存する（バックフィル）。
+#
+# 安全設計:
+#   - workflow_dispatch（手動実行）のみ。スケジュール実行はしない。
+#   - dry_run 入力（デフォルト true）。true のときは対象一覧の表示
+#     のみで、Gemini API・DB保存・キャッシュ書き戻しは一切しない。
+#     運用手順は「まず dry_run=true で対象を確認 → 問題なければ
+#     false で本実行」の2段階。
+#   - 冪等性: gemini_evaluations に既に保存済みのURLはスキップする
+#     ため、誤って複数回 false で実行してもGemini APIが重複して
+#     呼ばれない。
+#   - LINE通知・SUUMOアクセスは一切しない。
+#   - 診断ワークフロー（inspect_detail_cache.yml）と同様、恒久的な
+#     運用ツールとして残す（将来また同様の空白が生じた場合に再利用）。
+# ============================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "true=対象一覧の表示のみ（安全・デフォルト） / false=実際にバックフィル実行"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read   # data.csv の変更・push は行わないため read のみ
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python セットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: 依存ライブラリをインストール
+        run: pip install -r requirements.txt
+
+      # scrape.yml と同じキー方式（蓄積型・restore-keysプレフィックス一致）。
+      # dry_run=false のときは書き込みが必要なため、restore専用の
+      # actions/cache/restore ではなく actions/cache（restore+自動保存）を使う。
+      # dry_run=true のときも DB は変化しないため、自動保存されても
+      # 実質的に同じ内容が保存されるだけで無害。
+      - name: DB・カーブキャッシュ復元
+        uses: actions/cache@v4
+        with:
+          path: |
+            evaluations.db
+            cache
+          key: suumo-eval-db-${{ github.run_id }}
+          restore-keys: |
+            suumo-eval-db-
+
+      - name: Gemini評価バックフィル実行
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: python backfill_gemini_evaluations.py
