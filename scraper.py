@@ -1084,12 +1084,30 @@ def main() -> None:
         # アクセス数 = 未登録の新着件数のみ（通常は当日の新着件数）。
         new_listing_urls  = [l.url for l in new_listings]
         uncached_urls_set = set(get_uncached_urls(new_listing_urls))
+        already_cached_count = len(new_listing_urls) - len(uncached_urls_set)
+        fetch_success_count  = 0
+        fetch_fail_count     = 0
         for listing in new_listings:
             if listing.url not in uncached_urls_set:
                 continue  # detail_cache に登録済みはスキップ（重複 fetch 防止）
             data = fetch_detail(listing.url)  # 内部で4秒待機・timeout=15秒
+            if data is not None:
+                fetch_success_count += 1
+            else:
+                fetch_fail_count += 1
             # 失敗（data=None）のときも「試み済み」として保存し、次回の重複 fetch を防ぐ
             save_detail_cache(listing.url, data or {"total_units": None, "repair_fund_monthly": None})
+
+        # 集計ログ: 母数（新着件数）と内訳（既存キャッシュ対象外／新規fetch成功・失敗）を
+        # 明示する。「0件成功」等の数字だけを見て「fetchが失敗した」と誤読されないよう、
+        # 母数と内訳を必ずセットで出す（過去に誤解を招いた反省を踏まえた表現）。
+        print(
+            f"[詳細取得サマリ] 新着{len(new_listings)}件 → "
+            f"キャッシュ既存(対象外){already_cached_count}件 / "
+            f"新規fetch対象{len(uncached_urls_set)}件"
+            f"（成功{fetch_success_count}件・失敗{fetch_fail_count}件）",
+            flush=True,
+        )
 
         # current 全件のキャッシュを DB から一括読み込み（新着は今保存、既知は以前保存）
         detail_cache = load_detail_cache([l.url for l in current])
@@ -1189,6 +1207,19 @@ def main() -> None:
             if listing.url in known_gemini and known_gemini[listing.url][0] < 4
         ]
         all_rejected = new_rejected + known_rejected
+
+        # 集計ログ: 母数（既知件数）と内訳（Gemini評価保存済み／未保存）を明示する。
+        # 「読み込み0件」だけを見て不具合と誤読されないよう、「未保存＝この物件が
+        # gemini_evaluations導入前から既知だったため対象外」という理由も添える。
+        gemini_missing_count = len(known_listings) - len(known_gemini)
+        print(
+            f"[参考枠サマリ] 既知{len(known_listings)}件 → "
+            f"Gemini評価保存済み{len(known_gemini)}件"
+            f"（未保存{gemini_missing_count}件はgemini_evaluations未登録のため対象外） / "
+            f"うち4★未満{len(known_rejected)}件",
+            flush=True,
+        )
+
         reference_candidates = _find_reference_candidates(all_rejected, est_map)
     except Exception as e:
         print(f"[警告] 参考枠の対象抽出に失敗（新着分のみで継続）: {e}", flush=True)
