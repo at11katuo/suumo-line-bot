@@ -1,0 +1,44 @@
+name: 【診断専用・手動のみ】TARGET_URL実効性確認
+
+# ============================================================
+# このワークフローの目的:
+#   本番の GitHub Secrets TARGET_URL が実際に意図通り機能しているか
+#   （新着・更新順パラメータ po=1&pj=2 を含むか、対象物件が検索結果の
+#   どの位置に来るか）を、値そのものを見ずに確認する。
+#
+# 安全設計:
+#   - workflow_dispatch（手動実行）のみ。スケジュール実行はしない。
+#   - TARGET_URL の値そのものはログに一切出力しない
+#     （check_target_url_effectiveness.py 側で真偽値のみ出力する設計）。
+#   - LINE通知・DB書き込み・data.csvコミット・キャッシュ書き込みは
+#     一切しない（SUUMOへの読み取りアクセスのみ）。
+#   - 診断ワークフロー（inspect_detail_cache.yml）と同様、恒久的な
+#     運用ツールとして残す。
+# ============================================================
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python セットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: 依存ライブラリをインストール
+        run: pip install -r requirements.txt
+
+      - name: TARGET_URL実効性確認（読み取り専用）
+        env:
+          TARGET_URL: ${{ secrets.TARGET_URL }}
+        run: python check_target_url_effectiveness.py
