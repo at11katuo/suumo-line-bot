@@ -4,7 +4,7 @@ tests/test_scraper_config.py
 scraper.py のモジュールレベル設定値（検索URL等）のテスト。
 """
 
-from scraper import DEFAULT_URL
+from scraper import DEFAULT_URL, MAX_PAGES
 
 
 class TestDefaultUrlSortOrder:
@@ -16,3 +16,11 @@ class TestDefaultUrlSortOrder:
         # （稲城市の物件が170番目で圏外になったケース）ための対策。
         assert "po=1" in DEFAULT_URL
         assert "pj=2" in DEFAULT_URL
+
+
+class TestMaxPages:
+
+    def test_max_pages_is_five(self):
+        # 新着・更新順にしても更新頻度次第で90件(旧3ページ)から漏れる
+        # 事例があったため、150件(5ページ)までカバー範囲を広げている。
+        assert MAX_PAGES == 5
