@@ -6,6 +6,7 @@
 
 import csv
 import json
+import math
 import os
 import re
 import sys
@@ -62,11 +63,18 @@ HEADERS = {
     "Sec-Fetch-User": "?1",
 }
 
-MAX_PAGES = 5          # 取得する最大ページ数（150件）。新着・更新順(po=1&pj=2)
-                       # でも更新頻度次第で90件(旧3ページ)から漏れる事例が
-                       # 実際にあったため、カバー範囲を広げて見逃しを減らす
-REQUEST_INTERVAL = 2   # ページ間のウェイト（秒）。ページ数を増やしても
+REQUEST_INTERVAL = 2   # ページ間のウェイト（秒）。取得ページ数が変わっても
                        # 1回あたりの間隔は変えず、慎重スタンスを維持する
+
+# ── 取得ページ数の自動決定に使う定数 ──────────────────────────
+# 固定ページ数（3→5→10）を都度増やす対処を繰り返してきたが、SUUMOの
+# 検索結果総件数は市況により変動するため、根本対応として「1ページ目で
+# 総件数を読み取り、必要なページ数を都度計算する」方式に変更した。
+# MAX_PAGES は「固定取得ページ数」ではなく「安全上限（キャップ）」に
+# 役割を変えている。
+MAX_PAGES = 15          # 安全上限（450件）。計算結果がこれを超えたら打ち切る
+FALLBACK_PAGES = 10     # 総件数が読み取れない場合のデフォルト（旧実績値）
+ITEMS_PER_PAGE = 30     # SUUMO検索結果の1ページあたり件数（観測値。pc未指定時の既定）
 
 # 有望物件の判定しきい値
 PROMISING_SCORE_THRESHOLD = 70    # 売りやすさスコアの下限（100点満点）
@@ -156,11 +164,62 @@ def get_next_page_url(soup: BeautifulSoup, current_url: str) -> Optional[str]:
     return None
 
 
+def _extract_total_count(soup: BeautifulSoup) -> Optional[int]:
+    """
+    検索結果ページから総件数を読み取る。
+    div.pagination_set-hit（例: "226 件"）から数値を抽出する。
+    要素が見つからない・数値が取れない場合は None を返す（例外は出さない。
+    呼び出し側が None を「読み取り失敗」として安全なデフォルトに
+    フォールバックする設計のため）。
+    """
+    el = soup.select_one("div.pagination_set-hit")
+    if not el:
+        return None
+    m = re.search(r'([\d,]+)', el.get_text(strip=True))
+    if not m:
+        return None
+    try:
+        return int(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _calculate_pages_needed(total_count: Optional[int]) -> int:
+    """
+    総件数から必要な取得ページ数を計算する。
+
+    - total_count が None（読み取り失敗）なら FALLBACK_PAGES を返す
+      （固定ページ数だった頃の実績値。安全なデフォルト）。
+    - 計算結果が MAX_PAGES（安全上限）を超えるなら MAX_PAGES で
+      打ち切り、警告ログを出す（検索条件の異常や想定外の大量ヒットで
+      アクセス数が際限なく増えるのを防ぐため）。
+    """
+    if total_count is None:
+        print(
+            f"  [警告] 総件数の読み取りに失敗。"
+            f"デフォルト{FALLBACK_PAGES}ページで続行します。",
+            flush=True,
+        )
+        return FALLBACK_PAGES
+
+    needed = math.ceil(total_count / ITEMS_PER_PAGE)
+    if needed > MAX_PAGES:
+        print(
+            f"  [警告] 総件数{total_count}件は安全上限"
+            f"({MAX_PAGES}ページ={MAX_PAGES * ITEMS_PER_PAGE}件)を超えています。"
+            f"上限まで取得します。",
+            flush=True,
+        )
+        return MAX_PAGES
+    return needed
+
+
 def scrape(start_url: str) -> list[Listing]:
     all_listings: list[Listing] = []
     url: Optional[str] = start_url
+    effective_pages = FALLBACK_PAGES  # 1ページ目取得前の初期値（安全側のデフォルト）
 
-    for page in range(1, MAX_PAGES + 1):
+    for page in range(1, MAX_PAGES + 1):  # MAX_PAGESは絶対に超えない安全上限
         print(f"  ページ {page} 取得中: {url}", flush=True)
         try:
             soup = fetch_page(url)
@@ -168,9 +227,25 @@ def scrape(start_url: str) -> list[Listing]:
             print(f"  [警告] ページ取得失敗: {e}", flush=True)
             break
 
+        # 1ページ目取得直後に総件数を読み取り、必要ページ数を決定する。
+        # 読み取りに成功しても失敗しても、このページの parse_listings は
+        # 必ず実行・保持する（読み取り失敗時に「0ページ取得」になることを
+        # 避けるための二重防御）。
+        if page == 1:
+            total_count = _extract_total_count(soup)
+            effective_pages = _calculate_pages_needed(total_count)
+            if total_count is not None:
+                print(
+                    f"  総件数: {total_count}件 → 取得予定ページ数: {effective_pages}",
+                    flush=True,
+                )
+
         listings = parse_listings(soup)
         print(f"  → {len(listings)} 件パース", flush=True)
         all_listings.extend(listings)
+
+        if page >= effective_pages:
+            break
 
         next_url = get_next_page_url(soup, url)
         if not next_url:
