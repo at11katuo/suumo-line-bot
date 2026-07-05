@@ -467,6 +467,9 @@ class TestMainSashineWiring:
         #   （参考枠を new_listings の有無に関わらず実行するため）。
         #   このテストはその位置関係ではなく、呼び出し自体が存在することの
         #   確認に絞る。
+        # ※ notify_line_two_stage は AI★数表示のため gemini_score_map 引数が
+        #   追加されたので、関数名の呼び出しがある事実だけを確認する
+        #   （厳密な引数リストの文字列一致は見ない）。
         source = inspect.getsource(scraper.main)
-        assert "notify_line_two_stage(scored, est_map)" in source
+        assert "notify_line_two_stage(scored, est_map, gemini_score_map)" in source
         assert "notify_line_reference(reference_candidates, est_map)" in source

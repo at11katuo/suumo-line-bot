@@ -179,6 +179,15 @@ class TestBuildTextPromising:
         assert "確認してから" not in text
         assert "本日はじめて確認" not in text
 
+    def test_contains_gemini_score_when_provided(self):
+        text = _build_text_promising(make_listing(), "AI評価", make_est(), 1, gemini_score=4)
+        assert "AI評価: 4★" in text
+
+    def test_no_gemini_score_line_when_none(self):
+        # gemini_score 未指定なら「AI評価」行は出ない（既存互換・フォールバック維持）
+        text = _build_text_promising(make_listing(), "AI評価", make_est(), 1)
+        assert "AI評価:" not in text
+
 
 # ---------------------------------------------------------------------------
 # _build_text_compact のテスト
@@ -194,10 +203,6 @@ class TestBuildTextCompact:
 
     def test_contains_url(self):
         assert "https://suumo.jp/test/99999/" in _build_text_compact(make_listing(), 1)
-
-    def test_does_not_contain_score(self):
-        # 控えめ版にはスコアが出ない
-        assert "/100" not in _build_text_compact(make_listing(), 1)
 
     def test_shorter_than_promising(self):
         compact   = _build_text_compact(make_listing(), 1)
@@ -228,6 +233,55 @@ class TestBuildTextCompact:
         result = _build_text_compact(make_listing(), 1, "", age_days=None)
         assert "確認してから" not in result
         assert result == _build_text_compact(make_listing(), 1)
+
+    # ------------------------------------------------------------------
+    # AI評価(★数)・データ評価(スコア・乖離率)の表示
+    #
+    # 以前は「控えめ版にはスコアが出ない」ことを固定するテスト
+    # (test_does_not_contain_score) があったが、今回の要求（運用者が
+    # 全ての新着通知でAI★数・データ評価を見たい）によりこの方針を
+    # 転換したため削除した。以下がその新しい仕様のテスト。
+    # ------------------------------------------------------------------
+
+    def test_contains_gemini_score_when_provided(self):
+        result = _build_text_compact(make_listing(), 1, gemini_score=4)
+        assert "AI評価: 4★" in result
+
+    def test_no_gemini_score_line_when_none(self):
+        # gemini_score 未指定なら「AI評価」行は出ない（フォールバック維持）
+        result = _build_text_compact(make_listing(), 1)
+        assert "AI評価" not in result
+
+    def test_contains_data_evaluation_score_and_vs_fair(self):
+        est = make_est(resale_score=72, asking_vs_fair_pct=3.2)
+        result = _build_text_compact(make_listing(), 1, est=est)
+        assert "データ評価" in result
+        assert "スコア72/100" in result
+        assert "実勢比 +3.2%（割高）" in result
+
+    def test_data_evaluation_omitted_when_est_none(self):
+        # est 未指定なら「データ評価」行自体が出ない（フォールバック維持）
+        result = _build_text_compact(make_listing(), 1)
+        assert "データ評価" not in result
+
+    def test_data_evaluation_omitted_when_est_empty_dict(self):
+        # est はあるがスコア・乖離率どちらも取れない場合も行を出さない
+        result = _build_text_compact(make_listing(), 1, est={})
+        assert "データ評価" not in result
+
+    def test_partial_data_evaluation_score_only(self):
+        # 乖離率だけ欠けていてもスコアだけで行を出す（片方だけの欠損に対応）
+        result = _build_text_compact(make_listing(), 1, est=make_est(resale_score=80, asking_vs_fair_pct=None))
+        assert "データ評価" in result
+        assert "スコア80/100" in result
+        assert "実勢比" not in result
+
+    def test_notification_still_sent_when_both_gemini_and_est_missing(self):
+        # gemini_score・est どちらも欠けても、既存の必須項目（物件名・URL）は
+        # 変わらず出る（通知が消えないことの確認）
+        result = _build_text_compact(make_listing(), 1)
+        assert "テスト物件マンション101" in result
+        assert "https://suumo.jp/test/99999/" in result
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +392,73 @@ class TestNotifyLineTwoStage:
         with patch("scraper.requests.post") as mock_post:
             notify_line_two_stage([(make_listing(), "AI評価")], {})
         mock_post.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # gemini_score_map: 強調版・控えめ版どちらにもAI★数・データ評価が
+    # 反映されることの統合テスト
+    # ------------------------------------------------------------------
+
+    def test_gemini_score_map_shown_in_emphasized_message(self, line_env):
+        listing = make_listing()
+        est = make_est(resale_score=78, asking_vs_fair_pct=-3.0)  # 有望
+
+        with patch("scraper.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=200, text="OK")
+            notify_line_two_stage(
+                [(listing, "AI評価")], {listing.url: est}, {listing.url: 5},
+            )
+
+        sent = _collect_sent_texts(mock_post)
+        assert any("★★ 有望物件 ★★" in t for t in sent)
+        assert any("AI評価: 5★" in t for t in sent)
+
+    def test_gemini_score_map_shown_in_compact_message(self, line_env):
+        listing = make_listing()
+        est = make_est(resale_score=60, asking_vs_fair_pct=3.2)  # 非有望→控えめ版
+
+        with patch("scraper.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=200, text="OK")
+            notify_line_two_stage(
+                [(listing, "AI評価")], {listing.url: est}, {listing.url: 4},
+            )
+
+        sent = _collect_sent_texts(mock_post)
+        blob = "\n".join(sent)
+        assert "★★ 有望物件 ★★" not in blob
+        assert "AI評価: 4★" in blob
+        assert "データ評価" in blob
+        assert "スコア60/100" in blob
+
+    def test_gemini_score_map_omitted_does_not_break_notification(self, line_env):
+        # gemini_score_map 省略（既存呼び出し互換）でも通知は今まで通り出る
+        listing = make_listing()
+        with patch("scraper.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=200, text="OK")
+            notify_line_two_stage([(listing, "AI評価")], {})
+
+        sent = _collect_sent_texts(mock_post)
+        assert any("テスト物件マンション101" in t for t in sent)
+        assert not any("AI評価:" in t for t in sent)
+
+    def test_category_counts_unchanged_by_gemini_score_map(self, line_env):
+        # gemini_score_map の有無で、有望/非有望の判定件数（既存カテゴリ
+        # ロジック）が変わらないこと（非回帰）
+        listing = make_listing()
+        est = make_est(resale_score=78, asking_vs_fair_pct=-3.0)
+
+        with patch("scraper.requests.post") as mock_post_without:
+            mock_post_without.return_value = MagicMock(status_code=200, text="OK")
+            notify_line_two_stage([(listing, "AI評価")], {listing.url: est})
+        without_map = "\n".join(_collect_sent_texts(mock_post_without))
+
+        with patch("scraper.requests.post") as mock_post_with:
+            mock_post_with.return_value = MagicMock(status_code=200, text="OK")
+            notify_line_two_stage([(listing, "AI評価")], {listing.url: est}, {listing.url: 5})
+        with_map = "\n".join(_collect_sent_texts(mock_post_with))
+
+        # 両方とも同じく「有望物件 1件」の見出しになる（判定件数は不変）
+        assert "有望物件" in without_map and "1件" in without_map
+        assert "有望物件" in with_map and "1件" in with_map
 
 
 # ---------------------------------------------------------------------------
