@@ -442,13 +442,20 @@ class TestMainSashineWiring:
         idx_detect  = source.index("price_drop_alerts = detect_changes(")
         assert idx_sashine < idx_detect
 
-    def test_sashine_notify_runs_before_new_listings_early_return(self):
-        # 指値候補通知が「新着0件なら早期returnする」ゲートより前にある。
-        # ＝新着0件の日でも指値候補通知は実行される。
+    def test_sashine_notify_call_exists_and_no_new_listings_gate_remains(self):
+        # 指値候補通知の呼び出しが main() に存在すること。
+        #
+        # ※ Gemini評価件数上限対応（優先評価・data.csv保存の早期化/無条件化）
+        #   の実装により、以前あった「if not new_listings: return」という
+        #   早期returnは不要になり削除された（data.csv保存がGemini評価より
+        #   前で常に実行されるようになったため）。このテストはその削除が
+        #   復活していないかの回帰チェックを兼ねる。
+        #   「新着0件でも指値候補通知が実際に実行される」という実質的な
+        #   保証は test_main_integration.py の実行ベーステスト
+        #   （TestSashineRunsEvenWithoutNewListings）で確認済み。
         source = inspect.getsource(scraper.main)
-        idx_notify = source.index("notify_line_sashine_candidates(sashine_candidates)")
-        idx_gate   = source.index("if not new_listings:")
-        assert idx_notify < idx_gate
+        assert "notify_line_sashine_candidates(sashine_candidates)" in source
+        assert "if not new_listings:" not in source
 
     def test_price_drop_notify_runs_before_sashine_notify(self):
         # 実行順序: 値下げ通知 → 指値候補通知（フェーズ1で承認した順序）

@@ -275,6 +275,14 @@ class TestSashineRunsEvenWithoutNewListings:
         evaluator.evaluate_and_save(
             [listing], city_code="13208", db_path=db_path, _evaluated_date=past_date,
         )
+        # Gemini評価件数上限の対応（優先評価）により、gemini_evaluations
+        # 未登録の既知物件は自動的に評価対象になる。このテストは「指値候補・
+        # 参考枠いずれにも該当しない」ことを見たいので、Gemini評価済み
+        # （4★以上）として事前登録し、優先評価の対象から外す
+        # （参考枠は4★未満のみを対象にするため、評価済み4★以上なら
+        # 対象外のまま維持される）。
+        from gemini_cache import save_gemini_evaluation
+        save_gemini_evaluation(listing.url, 5, "評価済み", db_path=db_path)
 
         monkeypatch.setattr(scraper, "scrape", lambda url: [listing])
         monkeypatch.setattr(scraper, "evaluate_listing", lambda l: (0, ""))

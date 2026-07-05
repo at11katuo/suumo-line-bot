@@ -208,11 +208,19 @@ class TestReferenceSummaryLog:
         self, main_env, monkeypatch, capsys,
     ):
         # gemini_evaluations が未登録の既知物件（機能デプロイ前からの既知物件を再現）
-        # → 「未保存」件数として明示され、「対象外」という理由も分かる
-        listing = make_listing(url="https://suumo.jp/test/summary-h/")
-        scraper.save_listings(scraper.DATA_FILE, [listing])  # Gemini評価は一度も保存されない
+        # → 「未保存」件数として明示され、「対象外」という理由も分かる。
+        #
+        # ※ Gemini評価件数上限対応（優先評価）により、未登録の既知物件は
+        #   GEMINI_EVAL_LIMIT_PER_RUN件までは自動的に評価されるようになった。
+        #   「未保存」が残るケースを再現するため、上限を超える件数
+        #   （9件、上限8件）を用意し、1件だけが未評価のまま残ることを確認する。
+        listings = [
+            make_listing(url=f"https://suumo.jp/test/summary-h{i}/", name=f"物件{i}")
+            for i in range(scraper.GEMINI_EVAL_LIMIT_PER_RUN + 1)  # 9件
+        ]
+        scraper.save_listings(scraper.DATA_FILE, listings)  # Gemini評価は一度も保存されない
 
-        monkeypatch.setattr(scraper, "scrape", lambda url: [listing])
+        monkeypatch.setattr(scraper, "scrape", lambda url: listings)
         monkeypatch.setattr(scraper, "evaluate_listing", lambda l: (0, ""))
 
         with patch("scraper.requests.post") as mock_post:
@@ -220,8 +228,10 @@ class TestReferenceSummaryLog:
             scraper.main()
 
         out = capsys.readouterr().out
-        assert "[参考枠サマリ] 既知1件" in out
-        assert "Gemini評価保存済み0件" in out
+        assert f"[参考枠サマリ] 既知{len(listings)}件" in out
+        assert f"Gemini評価保存済み{scraper.GEMINI_EVAL_LIMIT_PER_RUN}件" in out
         assert "未保存1件" in out
         assert "gemini_evaluations未登録のため対象外" in out
-        assert "うち4★未満0件" in out
+        # 評価された8件は evaluate_listing のモックが score=0 を返すため
+        # 全て4★未満（うち4★未満8件）になる
+        assert f"うち4★未満{scraper.GEMINI_EVAL_LIMIT_PER_RUN}件" in out

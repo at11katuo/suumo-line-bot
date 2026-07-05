@@ -28,6 +28,13 @@ GEMINI_API_KEY: Optional[str] = os.environ.get("GEMINI_API_KEY")
 GEMINI_MODEL = "gemini-2.5-flash"
 DATA_FILE = "data.csv"
 
+# 1回の実行でGemini評価する件数の上限。無料枠は1日20リクエスト（モデルあたり）
+# だが、定期実行が1日2回あるため、1回あたりの上限は 20÷2=10 より少し
+# 余裕を持たせて8件にしている（8件×2回=16件/日で無料枠に収まる）。
+# 新着が大量発生した日に全件評価しようとすると429エラーが連鎖し実行が
+# 異常に長時間化する事故が実際に発生したための安全策。
+GEMINI_EVAL_LIMIT_PER_RUN = 8
+
 # 検索URLは環境変数で上書き可能
 # 対象: 調布市・府中市 / 中古マンション / 4000〜5500万円
 # ※徒歩・面積・築年数フィルターはURLパラメータ非対応のためPythonで後処理
@@ -1270,6 +1277,20 @@ def main() -> None:
     except Exception as e:
         print(f"[警告] 評価パイプライン失敗（通知は継続）: {e}", flush=True)
 
+    # ── data.csv 保存（Gemini評価より前に、必ず実行する）───────────────
+    # 以前は main() の最後（Gemini評価・参考枠処理より後）で保存していたが、
+    # 新着が大量発生した日にGemini評価ループが長時間化し、手動キャンセル
+    # されたことで data.csv 保存自体が一度も実行されず、フィルタ通過した
+    # 全物件の記録が失われる事故が実際に発生した。
+    # 詳細取得・reinfolib評価の直後、時間のかかるGemini評価より前に移動し、
+    # new_listings の有無に関わらず毎回実行することで、以降の処理が
+    # 中断しても記録は必ず残るようにする。
+    try:
+        save_listings(DATA_FILE, current)
+        print("data.csv を更新しました。", flush=True)
+    except Exception as e:
+        print(f"[警告] data.csv 保存に失敗: {e}", flush=True)
+
     # 値下げ・スコア改善通知（2段階通知より先に送る）
     if price_drop_alerts:
         notify_line_price_drops(price_drop_alerts)
@@ -1280,15 +1301,53 @@ def main() -> None:
     # 有無に関わらずここで送る。該当0件なら内部で何も送信しない）
     notify_line_sashine_candidates(sashine_candidates)
 
-    # ── Gemini評価: 新着のみ（現状維持。API呼び出し回数を増やさない）──────────
+    # ── Gemini評価: 新着 + 優先評価対象（前回上限で見送った既知物件）──────
+    # 1回のGemini呼び出し件数に上限(GEMINI_EVAL_LIMIT_PER_RUN)を設ける。
+    # 新着が大量発生した日に全件評価しようとすると、無料枠のレート制限
+    # （1日20リクエスト）に抵触して429が連鎖し、実行が異常に長時間化する
+    # 事故が実際に発生したための対策。
+    #
+    # 優先度: 前回見送られた既知物件 → 今回の新着、の順で評価する
+    # （新着が続くたびに古いバックログが際限なく後回しにされるのを防ぐ）。
+    # 既知物件のうち gemini_evaluations 未登録のものは
+    # backfill_gemini_evaluations.find_backfill_targets と全く同じ
+    # ロジックで検出する（「未評価かどうか」の判定基準を二重管理しない）。
     scored:           list[tuple[Listing, str]]      = []
     new_rejected:     list[tuple[Listing, int, str]] = []  # (listing, gemini★, eval_text)
     gemini_score_map: dict[str, int] = {}  # 通知文面にAI評価の★数を表示するため保持
-    if new_listings:
-        print(f"Gemini で {len(new_listings)} 件を評価中...", flush=True)
+
+    new_listing_urls_now = {l.url for l in new_listings}
+    known_listings_now    = [l for l in current if l.url not in new_listing_urls_now]
+    try:
+        from backfill_gemini_evaluations import find_backfill_targets  # 循環インポート回避
+        unevaluated_known = find_backfill_targets(known_listings_now)
+    except Exception as e:
+        print(f"[警告] 優先評価対象の抽出に失敗（新着のみで継続）: {e}", flush=True)
+        unevaluated_known = []
+
+    eval_targets = unevaluated_known + new_listings  # 優先度順（既知の未評価分→新着）
+    targets_now  = eval_targets[:GEMINI_EVAL_LIMIT_PER_RUN]
+    skipped_now  = eval_targets[GEMINI_EVAL_LIMIT_PER_RUN:]
+    unevaluated_known_urls = {l.url for l in unevaluated_known}
+
+    print(
+        f"[Gemini評価サマリ] 優先(未評価の既知物件){len(unevaluated_known)}件 + "
+        f"新着{len(new_listings)}件 = 対象{len(eval_targets)}件",
+        flush=True,
+    )
+    if skipped_now:
+        print(
+            f"[警告] Gemini評価件数が上限({GEMINI_EVAL_LIMIT_PER_RUN}件)を超えたため、"
+            f"{len(skipped_now)}件は次回の実行に持ち越します。",
+            flush=True,
+        )
+
+    if targets_now:
+        print(f"Gemini で {len(targets_now)} 件を評価中...", flush=True)
         from gemini_cache import save_gemini_evaluation  # 循環インポート回避
 
-        for listing in new_listings:
+        new_targets_processed = 0
+        for listing in targets_now:
             score, eval_text = evaluate_listing(listing)
             gemini_score_map[listing.url] = score
             # 初回評価時のみ保存。以後この物件が既知物件になっても、この
@@ -1297,22 +1356,31 @@ def main() -> None:
                 save_gemini_evaluation(listing.url, score, eval_text)
             except Exception as e:
                 print(f"[警告] Gemini評価の保存に失敗（評価自体は継続）: {e}", flush=True)
-            if score >= 4:
-                scored.append((listing, eval_text))
+
+            if listing.url in unevaluated_known_urls:
+                # 優先評価された既知物件は、もう「新着」ではないため
+                # 2段階通知(scored/new_rejected)には入れない。
+                # gemini_evaluations への保存のみ行い、4★未満なら次回以降の
+                # 参考枠判定で自然に拾われる（4★以上でも新着通知はしない）。
+                pass
             else:
-                # 4★未満は従来は捨てていた。参考枠判定のため (物件, ★数, 評価文) を保持する。
-                new_rejected.append((listing, score, eval_text))
+                new_targets_processed += 1
+                if score >= 4:
+                    scored.append((listing, eval_text))
+                else:
+                    # 4★未満は従来は捨てていた。参考枠判定のため (物件, ★数, 評価文) を保持する。
+                    new_rejected.append((listing, score, eval_text))
             time.sleep(15)  # Gemini API TPM制限対策（無料枠: 429回避）
 
-        skipped = len(new_listings) - len(scored)
-        print(f"4★以上: {len(scored)} 件 / 3★以下スキップ: {skipped} 件", flush=True)
+        skipped_low_score = new_targets_processed - len(scored)
+        print(f"4★以上: {len(scored)} 件 / 3★以下スキップ: {skipped_low_score} 件", flush=True)
 
         if scored:
             notify_line_two_stage(scored, est_map, gemini_score_map)
         else:
             print("通知対象（4★以上）の物件はありませんでした。", flush=True)
     else:
-        print("新着物件はありませんでした。", flush=True)
+        print("Gemini評価対象の物件はありませんでした。", flush=True)
 
     # ── 参考枠（第3カテゴリ。current全件が対象。new_listingsの有無に関わらず実行）──
     # 新着分(new_rejected) + 既知物件分（gemini_cache に保存済みの Gemini評価が
@@ -1354,12 +1422,7 @@ def main() -> None:
     # 参考枠通知。該当0件なら内部で何も送らない。既存の2段階通知には一切影響しない。
     notify_line_reference(reference_candidates, est_map)
 
-    if not new_listings:
-        print("=== 完了 ===", flush=True)
-        return
-
-    save_listings(DATA_FILE, current)
-    print("data.csv を更新しました。", flush=True)
+    # data.csv は評価パイプライン直後（Gemini評価より前）で既に保存済み。
     print("=== 完了 ===", flush=True)
 
 
