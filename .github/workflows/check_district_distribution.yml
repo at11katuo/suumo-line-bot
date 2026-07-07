@@ -1,0 +1,42 @@
+name: 【診断専用・手動のみ】地区別サンプル数分布確認
+
+# ============================================================
+# このワークフローの目的:
+#   地区単位の減価カーブ導入（フォールバック閾値の決定）にあたり、
+#   対象3市（府中市・調布市・稲城市）の実際の取引データで、
+#   地区別・築年数バケット別のサンプル数分布を確認する。
+#
+# 安全設計:
+#   - workflow_dispatch（手動実行）のみ。スケジュール実行はしない。
+#   - キャッシュファイル・DBへの書き込みは一切しない（表示のみ）。
+#   - LINE通知・data.csvの変更もしない。
+#   - 診断ワークフロー（inspect_detail_cache.yml等）と同様、恒久的な
+#     運用ツールとして残す。
+# ============================================================
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python セットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: 依存ライブラリをインストール
+        run: pip install -r requirements.txt
+
+      - name: 地区別サンプル数分布確認（読み取り専用・キャッシュ保存なし）
+        env:
+          REINFOLIB_API_KEY: ${{ secrets.REINFOLIB_API_KEY }}
+        run: python check_district_sample_distribution.py
