@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import random
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -38,6 +39,7 @@ from reinfolib_resale import (
     AGE_BUCKETS,
     DepreciationCurve,
     ReinfolibClient,
+    Trade,
     build_depreciation_curve,
     normalize,
 )
@@ -67,6 +69,14 @@ CACHE_TTL_DAYS = 90
 
 # キャッシュの保存先ディレクトリ（.gitignore で追跡対象外）
 CACHE_DIR = Path(__file__).parent / "cache"
+
+# 地区単位カーブのサンプル数閾値。build_depreciation_curve の
+# デフォルト min_samples=3 では中央値が外れ値1件で大きく動きうるため、
+# より高めの値にする。実データ（3市合計）で閾値ごとの充足状況を確認した結果:
+#   3件以上=294 / 5件以上=234 / 8件以上=167 / 10件以上=146 / 15件以上=98 組み合わせ
+# 統計的な安定性とカバレッジのバランスから8件を採用する
+# （check_district_sample_distribution.py で実データ確認済み）。
+DISTRICT_MIN_SAMPLES = 8
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +111,49 @@ def _make_mock_trades(city_code: str, start_year: int, end_year: int) -> list[di
                 "DistrictName":  "テスト町",
             })
     return rows
+
+
+# ---------------------------------------------------------------------------
+# 地区単位カーブ
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CurveBundle:
+    """
+    市単位カーブと地区単位カーブ群をまとめて持つ。
+
+    地区単位カーブは、市単位カーブの生成に使ったものと同じ取引データ
+    （trades）を地区(district)ごとに再集計するだけで作る。地区単位カーブの
+    ために国交省APIを追加で呼び出すことはない。
+    """
+    city_curve: DepreciationCurve
+    district_curves: dict[str, DepreciationCurve] = field(default_factory=dict)
+
+
+def _build_district_curves(
+    trades: list[Trade], min_samples: int = DISTRICT_MIN_SAMPLES,
+) -> dict[str, DepreciationCurve]:
+    """
+    取引データを地区(district)ごとにグルーピングし、それぞれについて
+    build_depreciation_curve を実行する。
+
+    地区名が空の取引（district=""）は除外する。生成したカーブが
+    1バケットも埋まらなかった地区（サンプル数が全バケットで
+    min_samples未満）は結果に含めない（district_curves に存在しない
+    ＝常に市単位カーブへフォールバックする、という扱いになる）。
+    """
+    by_district: dict[str, list[Trade]] = {}
+    for t in trades:
+        if not t.district:
+            continue
+        by_district.setdefault(t.district, []).append(t)
+
+    result: dict[str, DepreciationCurve] = {}
+    for district, district_trades in by_district.items():
+        curve = build_depreciation_curve(district_trades, min_samples=min_samples)
+        if curve.median_unit_price:
+            result[district] = curve
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -207,22 +260,117 @@ def _save_cache(
 
 
 # ---------------------------------------------------------------------------
+# 地区単位カーブ込みキャッシュ（CurveBundle）
+# ---------------------------------------------------------------------------
+# 市単位カーブ専用の _cache_path/_load_cache/_save_cache とは別に、
+# 市単位＋地区単位をまとめて1ファイルにキャッシュする。
+# 1回の get_curve_bundle 呼び出しで作られるキャッシュファイルが1つになる
+# ようにするため（市単位・地区単位を別ファイルにすると、キャッシュの
+# 有効期限が別々にずれてtradesの再取得タイミングが噛み合わなくなる）。
+
+def _bundle_cache_path(city_code: str, start_year: int, end_year: int) -> Path:
+    """地区単位カーブ込みキャッシュファイルのパスを返す。"""
+    return CACHE_DIR / f"curve_bundle_{city_code}_{start_year}_{end_year}.json"
+
+
+def _curve_bundle_to_dict(bundle: CurveBundle) -> dict:
+    """CurveBundle を JSON に保存できる dict に変換する（既存の _curve_to_dict を再利用）。"""
+    return {
+        "city_curve": _curve_to_dict(bundle.city_curve),
+        "district_curves": {
+            district: _curve_to_dict(curve)
+            for district, curve in bundle.district_curves.items()
+        },
+    }
+
+
+def _dict_to_curve_bundle(d: dict) -> CurveBundle:
+    """JSON から読み戻した dict を CurveBundle に復元する（既存の _dict_to_curve を再利用）。"""
+    return CurveBundle(
+        city_curve=_dict_to_curve(d["city_curve"]),
+        district_curves={
+            district: _dict_to_curve(curve_d)
+            for district, curve_d in d["district_curves"].items()
+        },
+    )
+
+
+def _load_bundle_cache(path: Path) -> Optional[CurveBundle]:
+    """
+    キャッシュファイルを読み込む。ロジックは _load_cache と同じ
+    （存在チェック・TTLチェック）。
+    """
+    if not path.exists():
+        return None
+
+    with path.open(encoding="utf-8") as f:
+        data = json.load(f)
+
+    fetched_at = datetime.fromisoformat(data["fetched_at"])
+    age_days = (datetime.now() - fetched_at).days
+    if age_days >= CACHE_TTL_DAYS:
+        logger.info(
+            "キャッシュ期限切れのため無視します（%d日経過 / 有効期限%d日）: %s",
+            age_days, CACHE_TTL_DAYS, path.name,
+        )
+        return None
+
+    logger.info(
+        "キャッシュを使用します: %s（取得日: %s、%d日経過）",
+        path.name, fetched_at.date(), age_days,
+    )
+    return _dict_to_curve_bundle(data["bundle"])
+
+
+def _save_bundle_cache(
+    path: Path,
+    city_code: str,
+    city_name: str,
+    start_year: int,
+    end_year: int,
+    trade_count: int,
+    bundle: CurveBundle,
+) -> None:
+    """市単位カーブ＋地区単位カーブ群を JSON ファイルに保存する。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "fetched_at":  datetime.now().isoformat(timespec="seconds"),
+        "city_code":   city_code,
+        "city_name":   city_name,
+        "start_year":  start_year,
+        "end_year":    end_year,
+        "trade_count": trade_count,
+        "bundle":      _curve_bundle_to_dict(bundle),
+    }
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    logger.info(
+        "キャッシュ保存: %s（取引数: %d件、地区カーブ%d件）",
+        path.name, trade_count, len(bundle.district_curves),
+    )
+
+
+# ---------------------------------------------------------------------------
 # メイン関数（ライブラリとしても使える）
 # ---------------------------------------------------------------------------
 
-def get_curve(
+def get_curve_bundle(
     city_name: str,
     city_code: str,
     start_year: int = FETCH_START_YEAR,
     end_year: int   = FETCH_END_YEAR,
     force_refresh: bool = False,
-) -> Optional[DepreciationCurve]:
+) -> Optional[CurveBundle]:
     """
-    指定エリアの減価カーブを返す。
+    指定エリアの市単位カーブ＋地区単位カーブ群をまとめて返す。
 
     - キャッシュが有効期限（90日）以内なら API を叩かずキャッシュを返す
     - force_refresh=True のときはキャッシュを無視して再取得する
     - 環境変数 USE_MOCK_REINFOLIB=1 のとき、API を叩かずモックデータを使う
+    - 地区単位カーブは、市単位カーブと同じ取引データ（trades）を地区ごとに
+      再集計するだけで作る。地区単位カーブのために API を追加で呼ぶことはない。
 
     引数:
         city_name     : 市区町村名（ログ用）
@@ -232,13 +380,13 @@ def get_curve(
         force_refresh : True のとき有効期限内のキャッシュも無視する
 
     戻り値:
-        DepreciationCurve（カーブ生成に失敗した場合は None）
+        CurveBundle（カーブ生成に失敗した場合は None）
     """
-    path = _cache_path(city_code, start_year, end_year)
+    path = _bundle_cache_path(city_code, start_year, end_year)
 
     # --- キャッシュチェック ---
     if not force_refresh:
-        cached = _load_cache(path)
+        cached = _load_bundle_cache(path)
         if cached is not None:
             return cached
     else:
@@ -270,22 +418,50 @@ def get_curve(
             end_year=end_year,
         )
 
-    # --- 正規化 → カーブ生成 ---
+    # --- 正規化 → 市単位カーブ生成 ---
     trades = normalize(raw_rows)
     if not trades:
         logger.warning("%s: 正規化後の取引データが0件でした。カーブを生成できません。", city_name)
         return None
 
-    curve = build_depreciation_curve(trades)
-    if not curve.median_unit_price:
+    city_curve = build_depreciation_curve(trades)
+    if not city_curve.median_unit_price:
         logger.warning(
             "%s: サンプル数不足でバケットが埋まりませんでした（取引数: %d件）。",
             city_name, len(trades),
         )
         return None
 
-    _save_cache(path, city_code, city_name, start_year, end_year, len(trades), curve)
-    return curve
+    # --- 地区単位カーブ生成（同じ trades から再集計。追加のAPI呼び出しなし）---
+    district_curves = _build_district_curves(trades)
+    logger.info(
+        "%s: 地区単位カーブ %d 地区分を生成しました（サンプル数%d件以上の(地区,築年数バケット)のみ）。",
+        city_name, len(district_curves), DISTRICT_MIN_SAMPLES,
+    )
+
+    bundle = CurveBundle(city_curve=city_curve, district_curves=district_curves)
+    _save_bundle_cache(path, city_code, city_name, start_year, end_year, len(trades), bundle)
+    return bundle
+
+
+def get_curve(
+    city_name: str,
+    city_code: str,
+    start_year: int = FETCH_START_YEAR,
+    end_year: int   = FETCH_END_YEAR,
+    force_refresh: bool = False,
+) -> Optional[DepreciationCurve]:
+    """
+    指定エリアの市単位減価カーブを返す（従来からの呼び出し方をそのまま
+    維持するための互換関数）。
+
+    内部では get_curve_bundle を呼び、市単位カーブ部分だけを取り出して
+    返す。地区単位カーブも同じ取引データから同時に生成・キャッシュされる
+    が、この関数の戻り値には含まれない（地区単位カーブが必要な場合は
+    get_curve_bundle を直接使うこと）。
+    """
+    bundle = get_curve_bundle(city_name, city_code, start_year, end_year, force_refresh)
+    return bundle.city_curve if bundle else None
 
 
 # ---------------------------------------------------------------------------

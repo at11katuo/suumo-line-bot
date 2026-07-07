@@ -4,9 +4,10 @@ evaluator.py
 SUUMO 収集結果（Listing）を評価し、結果を SQLite に保存するパイプライン。
 
 3 つの部品を結合する:
-  1. suumo_adapter.suumo_to_candidate()  : Listing → Candidate（変換）
-  2. build_curves.get_curve()            : エリアの減価カーブ取得
-  3. reinfolib_resale.estimate_resale()  : Candidate + カーブ → 評価結果
+  1. suumo_adapter.suumo_to_candidate()  : Listing → Candidate（変換、地区名も抽出）
+  2. build_curves.get_curve_bundle()     : エリアの減価カーブ取得（市単位＋地区単位）
+  3. reinfolib_resale.select_curve()     : 地区単位に十分なサンプルがあれば優先、なければ市単位にフォールバック
+  4. reinfolib_resale.estimate_resale()  : Candidate + カーブ → 評価結果
 
 【手動実行の使い方】
     # モックモード（APIキー不要・動作確認用）
@@ -30,8 +31,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
-from build_curves import TARGET_AREAS, get_curve
-from reinfolib_resale import estimate_resale
+from build_curves import TARGET_AREAS, get_curve_bundle
+from reinfolib_resale import estimate_resale, select_curve
 from scraper import Listing
 from suumo_adapter import suumo_to_candidate
 
@@ -83,6 +84,7 @@ def _init_db(conn: sqlite3.Connection) -> None:
             resale_score            INTEGER,               -- 売りやすさスコア 0〜100
             notes                   TEXT,                  -- 注意書き（JSON配列）
             hold_years              INTEGER,               -- 想定保有年数
+            curve_source            TEXT,                  -- 使用したカーブ（district:地区名(n=件数) / city:市名）
             -- 同日同物件は1行（UPSERT）。別日は新規行として履歴が積まれる。
             UNIQUE(listing_url, evaluated_date)
         )
@@ -92,6 +94,14 @@ def _init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_listing_url
         ON evaluations(listing_url)
     """)
+
+    # 既存DBへのマイグレーション: CREATE TABLE IF NOT EXISTS は既存テーブルには
+    # 何もしないため、既にテーブルがあって curve_source カラムがない場合は
+    # ここで追加する（本番DBがこの機能追加前から存在するケースへの対応）。
+    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(evaluations)").fetchall()}
+    if "curve_source" not in existing_columns:
+        conn.execute("ALTER TABLE evaluations ADD COLUMN curve_source TEXT")
+
     conn.commit()
 
 
@@ -122,14 +132,14 @@ def _upsert(
             asking_price, area_sqm, building_year, walk_minutes, floor_plan,
             current_fair_unit_price, current_fair_price, asking_vs_fair_pct,
             future_resale_price, net_after_tax_and_cost,
-            resale_score, notes, hold_years
+            resale_score, notes, hold_years, curve_source
         ) VALUES (
             ?, ?, ?,
             ?, ?,
             ?, ?, ?, ?, ?,
             ?, ?, ?,
             ?, ?,
-            ?, ?, ?
+            ?, ?, ?, ?
         )
         ON CONFLICT(listing_url, evaluated_date)
         DO UPDATE SET
@@ -147,7 +157,8 @@ def _upsert(
             net_after_tax_and_cost  = excluded.net_after_tax_and_cost,
             resale_score            = excluded.resale_score,
             notes                   = excluded.notes,
-            hold_years              = excluded.hold_years
+            hold_years              = excluded.hold_years,
+            curve_source            = excluded.curve_source
         """,
         (
             listing.url,
@@ -168,6 +179,7 @@ def _upsert(
             estimate.resale_score,
             json.dumps(estimate.notes, ensure_ascii=False),  # list[str] → JSON文字列
             hold_years,
+            estimate.curve_source,
         ),
     )
 
@@ -246,10 +258,10 @@ def evaluate_and_save(
     today = _evaluated_date or date.today().isoformat()
     now   = datetime.now().isoformat(timespec="seconds")
 
-    # --- エリアの減価カーブ取得 ---
-    name  = _city_name(city_code)
-    curve = get_curve(city_name=name, city_code=city_code)
-    if curve is None:
+    # --- エリアのカーブ束（市単位＋地区単位）取得 ---
+    name   = _city_name(city_code)
+    bundle = get_curve_bundle(city_name=name, city_code=city_code)
+    if bundle is None:
         logger.warning(
             "evaluate_and_save: %s（%s）のカーブが取得できませんでした。"
             "%d 件をスキップします。",
@@ -266,15 +278,25 @@ def evaluate_and_save(
         for listing in listings:
             # Listing → Candidate（詳細キャッシュがあれば total_units / repair_fund_per_sqm も設定）
             # detail_cache に URL がない場合（未取得 or 取得失敗）は detail=None → 中立スコア
+            # city_name を渡すことで、地区名抽出（district）も行われる。
             candidate = suumo_to_candidate(
                 listing,
                 detail=detail_cache.get(listing.url) if detail_cache else None,
+                city_name=name,
             )
             if candidate is None:
                 continue  # suumo_to_candidate 側で warning ログ済み
 
+            # --- カーブ選択（地区単位に十分なサンプルがあれば優先、なければ市単位）---
+            current_age = year - candidate.building_year
+            curve, curve_source = select_curve(
+                candidate.district, bundle.city_curve, bundle.district_curves,
+                current_age, city_name=name,
+            )
+            logger.info("[カーブ選択] %s: %s", listing.name, curve_source)
+
             # 評価実行
-            est = estimate_resale(candidate, curve, year, hold_years)
+            est = estimate_resale(candidate, curve, year, hold_years, curve_source=curve_source)
 
             # SQLite に UPSERT
             _upsert(conn, listing, city_code, candidate, est, hold_years, today, now)

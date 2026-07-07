@@ -29,6 +29,7 @@ import detail_fetcher
 import evaluator
 import gemini_cache
 import scraper
+from build_curves import CurveBundle
 from gemini_cache import load_gemini_evaluations, save_gemini_evaluation
 from reinfolib_resale import DepreciationCurve
 from scraper import Listing, _find_reference_candidates, _is_promising
@@ -290,7 +291,10 @@ def main_env(tmp_path, monkeypatch):
     monkeypatch.setattr(build_curves, "CACHE_DIR", tmp_path / "cache")
     monkeypatch.setenv("USE_MOCK_REINFOLIB", "1")
 
-    monkeypatch.setattr(evaluator, "get_curve", lambda **kwargs: _FIXED_CURVE)
+    monkeypatch.setattr(
+        evaluator, "get_curve_bundle",
+        lambda **kwargs: CurveBundle(city_curve=_FIXED_CURVE, district_curves={}),
+    )
     monkeypatch.setattr(build_curves, "get_curve", lambda **kwargs: _FIXED_CURVE)
 
     monkeypatch.setattr(scraper, "DATA_FILE", str(tmp_path / "data.csv"))

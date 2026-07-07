@@ -234,6 +234,42 @@ def build_depreciation_curve(
     return curve
 
 
+def select_curve(
+    district: Optional[str],
+    city_curve: DepreciationCurve,
+    district_curves: dict[str, DepreciationCurve],
+    current_age: int,
+    city_name: str,
+) -> tuple[DepreciationCurve, str]:
+    """
+    地区単位カーブに十分なサンプルがあればそれを、なければ市単位カーブに
+    フォールバックして使う。どちらを使ったかを表す説明文字列も一緒に返す
+    （評価結果・ログに残して透明性を確保するため）。
+
+    判定は「物件の現在の築年数バケット」1つだけで行う（現在価値と将来価値の
+    両方に同じカーブを使う。current_ageとfuture_ageで別々のカーブを混在させると
+    説明が複雑になり、透明性という目的に反するため）。
+
+    地区カーブが選ばれるのは、district_curves[district] が存在し、かつ
+    そのカーブの median_unit_price に現在の築年数バケットが実在するとき
+    （＝build_depreciation_curveの時点でサンプル数閾値を満たしたバケット）
+    だけ。サンプル不足のバケットは build_depreciation_curve が最初から
+    含めないため、ここで閾値を再チェックする必要はない。
+
+    地区名が不明（None）・地区カーブが存在しない・該当バケットのサンプルが
+    不足している、いずれの場合も例外を投げず市単位カーブへ安全に
+    フォールバックする。
+    """
+    if district:
+        district_curve = district_curves.get(district)
+        if district_curve is not None:
+            bucket = _bucket_of(current_age)
+            if bucket in district_curve.median_unit_price:
+                n = district_curve.sample_count.get(bucket, 0)
+                return district_curve, f"district:{district}(n={n})"
+    return city_curve, f"city:{city_name}"
+
+
 # ---------------------------------------------------------------------------
 # 4. 候補物件の評価（ヤドカリ向け）
 # ---------------------------------------------------------------------------
@@ -247,6 +283,7 @@ class Candidate:
     total_units: Optional[int] = None         # 総戸数
     repair_fund_per_sqm: Optional[float] = None  # 修繕積立金 円/㎡・月
     floor_plan: str = ""
+    district: Optional[str] = None  # 地区名（国交省DistrictNameとの完全一致用。不明ならNone）
 
 
 @dataclass
@@ -259,6 +296,10 @@ class ResaleEstimate:
     net_after_tax_and_cost: Optional[float]  # 諸費用・譲渡税を引いた手取り見込み
     resale_score: int                        # 0-100 売りやすさ
     notes: list[str] = field(default_factory=list)
+    # どのカーブを使って評価したか（例: "district:紅葉丘(n=19)" / "city:府中市"）。
+    # 呼び出し側（select_curve）が決めた説明文字列をそのまま記録するだけで、
+    # このモジュール自身は地区/市の判定ロジックを持たない。
+    curve_source: str = ""
 
 
 # 譲渡所得税: 所有5年以下=短期39.63% / 5年超=長期20.315%
@@ -273,6 +314,7 @@ def estimate_resale(
     curve: DepreciationCurve,
     current_year: int,
     hold_years: int,
+    curve_source: str = "",
 ) -> ResaleEstimate:
     notes: list[str] = []
     current_age = current_year - cand.building_year
@@ -312,6 +354,7 @@ def estimate_resale(
         net_after_tax_and_cost=net,
         resale_score=score,
         notes=notes,
+        curve_source=curve_source,
     )
 
 

@@ -107,6 +107,37 @@ def _parse_walk_minutes(station_str: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+def _extract_district(location: str, city_name: str) -> Optional[str]:
+    """
+    住所文字列から市名より後ろの部分を取り出し、末尾の丁目・番地
+    （数字・ハイフン）を除去して地区名候補を作る。
+
+    対応パターン:
+      "東京都府中市紅葉丘２"     + "府中市" → "紅葉丘"
+      "東京都稲城市矢野口"       + "稲城市" → "矢野口"
+      "東京都調布市多摩川１－２" + "調布市" → "多摩川"
+
+    ここで作るのは「候補」に過ぎない。国交省の地区名（DistrictName）と
+    実際に一致するかどうかは呼び出し側（select_curve）が district_curves
+    の存在チェックで判定する。ここでは表記ゆれの正規化のみ行い、
+    一致するかどうかの判断はしない。
+
+    市名が住所に含まれない、または市名の後に何も残らない場合は None。
+    """
+    if not location or not city_name:
+        return None
+    idx = location.find(city_name)
+    if idx == -1:
+        return None
+    rest = location[idx + len(city_name):]
+    # 末尾の丁目・番地（半角/全角数字、ハイフン類）を除去する。
+    # ハイフン類は「－」(U+FF0D 全角ハイフンマイナス)・「−」(U+2212 マイナス
+    # 記号)・「ー」(U+30FC 長音記号、番地表記で使われることがある)・半角
+    # ハイフンの4種を対象にする（実際の住所表記で確認済みの組み合わせ）。
+    district = re.sub(r'[\d0-9０-９\-－−ー]+$', '', rest).strip()
+    return district or None
+
+
 # ---------------------------------------------------------------------------
 # 変換関数（公開インターフェース）
 # ---------------------------------------------------------------------------
@@ -114,6 +145,7 @@ def _parse_walk_minutes(station_str: str) -> Optional[int]:
 def suumo_to_candidate(
     listing: Listing,
     detail: Optional[dict] = None,
+    city_name: Optional[str] = None,
 ) -> Optional[Candidate]:
     """
     SUUMO の Listing を reinfolib_resale の Candidate に変換して返す。
@@ -128,6 +160,10 @@ def suumo_to_candidate(
                  {"total_units": int|None, "repair_fund_monthly": float|None} 形式。
                  None のとき（詳細未取得 or 取得失敗）は total_units / repair_fund_per_sqm が
                  中立（None）のまま → スコアに影響しない（フォールバック動作）。
+        city_name : 地区名抽出に使う市名（例: "府中市"）。呼び出し側が既に
+                 resolve_city_code 等で判定済みの市名をそのまま渡す想定。
+                 None のときは district=None のまま（地区単位カーブは
+                 使われず、常に市単位カーブにフォールバックする）。
 
     修繕積立金の㎡換算:
         詳細ページの値は月額総額（例: 24,080円/月）。
@@ -167,6 +203,8 @@ def suumo_to_candidate(
         if repair_fund_monthly is not None and area_sqm:
             repair_fund_per_sqm = repair_fund_monthly / area_sqm
 
+    district = _extract_district(listing.location, city_name) if city_name else None
+
     return Candidate(
         asking_price=asking_price,
         area_sqm=area_sqm,
@@ -174,5 +212,6 @@ def suumo_to_candidate(
         walk_minutes=_parse_walk_minutes(listing.station),
         total_units=total_units,
         repair_fund_per_sqm=repair_fund_per_sqm,
+        district=district,
         floor_plan=listing.floor_plan or "",
     )

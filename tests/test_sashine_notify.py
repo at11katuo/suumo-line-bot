@@ -74,7 +74,7 @@ _FIXED_CURVE = DepreciationCurve(
 def enable_mock_mode(monkeypatch):
     """
     USE_MOCK_REINFOLIB=1 を設定する。_seed_age_days 内の evaluate_and_save は
-    evaluator.py 内で module-level に束縛された get_curve を使うため
+    evaluator.py 内で module-level に import された get_curve_bundle を使うため
     （後述の fixed_curve フィクスチャの対象外）、これが実APIを叩かないよう
     モックモードにしておく必要がある。
     """
@@ -95,10 +95,10 @@ def fixed_curve(monkeypatch):
     _find_sashine_candidates は関数本体内で `from build_curves import get_curve`
     を毎回実行する（遅延インポート）ため、この差し替えは正しく反映される。
     一方 evaluate_and_save（_seed_age_days が使う）は evaluator.py の
-    モジュールレベルで import 済みの get_curve を使うため、この差し替えの
-    影響を受けない（実際にはモックモードのランダム生成カーブを使うが、
-    _seed_age_days は「履歴の日付」を作るためだけに使うので値のズレは
-    テストに影響しない）。
+    モジュールレベルで import 済みの get_curve_bundle を使うため、この
+    差し替えの影響を受けない（実際にはモックモードのランダム生成カーブを
+    使うが、_seed_age_days は「履歴の日付」を作るためだけに使うので値の
+    ズレはテストに影響しない）。
     """
     monkeypatch.setattr(build_curves, "get_curve", lambda **kwargs: _FIXED_CURVE)
 

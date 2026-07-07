@@ -257,6 +257,10 @@ class TestGetCurve:
         """
         2回目の get_curve はキャッシュから読むこと。
         キャッシュを改ざんして、改ざん後の値が返ることで確認する。
+
+        ※ get_curve は内部で get_curve_bundle に委譲するようになったため、
+        キャッシュファイルの構造は data["bundle"]["city_curve"] になった
+        （地区単位カーブ機能追加に伴う変更）。
         """
         # 1回目: モックデータでカーブ生成 → キャッシュ保存
         get_curve("調布市", "13208")
@@ -265,8 +269,8 @@ class TestGetCurve:
         # キャッシュの median_unit_price を全バケット 99999.0 に書き換える
         with cache_file.open(encoding="utf-8") as f:
             data = json.load(f)
-        for k in data["curve"]["median_unit_price"]:
-            data["curve"]["median_unit_price"][k] = 99999.0
+        for k in data["bundle"]["city_curve"]["median_unit_price"]:
+            data["bundle"]["city_curve"]["median_unit_price"][k] = 99999.0
         with cache_file.open("w", encoding="utf-8") as f:
             json.dump(data, f)
 
@@ -283,8 +287,8 @@ class TestGetCurve:
         cache_file = next(tmp_path.glob("*.json"))
         with cache_file.open(encoding="utf-8") as f:
             data = json.load(f)
-        for k in data["curve"]["median_unit_price"]:
-            data["curve"]["median_unit_price"][k] = 99999.0
+        for k in data["bundle"]["city_curve"]["median_unit_price"]:
+            data["bundle"]["city_curve"]["median_unit_price"][k] = 99999.0
         with cache_file.open("w", encoding="utf-8") as f:
             json.dump(data, f)
 

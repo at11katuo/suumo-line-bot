@@ -204,8 +204,8 @@ class TestSkip:
         assert _count_rows(db_path) == 1
 
     def test_no_curve_skips_all(self, db_path, monkeypatch):
-        # get_curve が None を返すとき → 全件スキップ、DB は空のまま
-        monkeypatch.setattr(evaluator, "get_curve", lambda *a, **kw: None)
+        # get_curve_bundle が None を返すとき → 全件スキップ、DB は空のまま
+        monkeypatch.setattr(evaluator, "get_curve_bundle", lambda *a, **kw: None)
         n = evaluate_and_save([make_listing()], CHOFU_CODE, db_path=db_path)
         assert n == 0
         # DBファイルが作られていないか、テーブルが空であること
