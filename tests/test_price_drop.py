@@ -393,6 +393,15 @@ class TestBuildTextPriceDrop:
 # ---------------------------------------------------------------------------
 
 class TestNotifyLinePriceDrops:
+    """
+    ⚠ db_path を必ず明示的に渡すこと。
+    notify_line_price_drops は LINE 送信成功後に
+    evaluator.mark_price_change_notified を呼ぶため、db_path を省略すると
+    evaluator.DB_PATH（本番の evaluations.db）に書き込んでしまう
+    （実際にこの引数漏れで本番DBに test/99999 という偽URLが
+    price_change_notifications テーブルへ書き込まれる事故が起きたため、
+    二度と忘れないようここに明記する）。
+    """
 
     def _make_alert(self) -> dict:
         return {
@@ -412,28 +421,28 @@ class TestNotifyLinePriceDrops:
             },
         }
 
-    def test_empty_alerts_no_api_call(self, line_env):
+    def test_empty_alerts_no_api_call(self, line_env, db_path):
         with patch("scraper.requests.post") as mock_post:
-            notify_line_price_drops([])
+            notify_line_price_drops([], db_path=db_path)
         mock_post.assert_not_called()
 
-    def test_header_contains_emoji_and_count(self, line_env):
+    def test_header_contains_emoji_and_count(self, line_env, db_path):
         with patch("scraper.requests.post") as mock_post:
             mock_post.return_value = MagicMock(status_code=200, text="OK")
-            notify_line_price_drops([self._make_alert()])
+            notify_line_price_drops([self._make_alert()], db_path=db_path)
         sent = _collect_sent_texts(mock_post)
         assert any("📉" in t and "1件" in t for t in sent)
 
-    def test_body_contains_listing_name(self, line_env):
+    def test_body_contains_listing_name(self, line_env, db_path):
         with patch("scraper.requests.post") as mock_post:
             mock_post.return_value = MagicMock(status_code=200, text="OK")
-            notify_line_price_drops([self._make_alert()])
+            notify_line_price_drops([self._make_alert()], db_path=db_path)
         sent = _collect_sent_texts(mock_post)
         assert any("テスト物件マンション101" in t for t in sent)
 
-    def test_no_line_token_skips_without_exception(self, monkeypatch):
+    def test_no_line_token_skips_without_exception(self, monkeypatch, db_path):
         monkeypatch.setattr(scraper, "LINE_CHANNEL_ACCESS_TOKEN", None)
         monkeypatch.setattr(scraper, "LINE_USER_ID", None)
         with patch("scraper.requests.post") as mock_post:
-            notify_line_price_drops([self._make_alert()])
+            notify_line_price_drops([self._make_alert()], db_path=db_path)
         mock_post.assert_not_called()

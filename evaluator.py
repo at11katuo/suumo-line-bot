@@ -703,6 +703,144 @@ def mark_reference_notified(
 
 
 # ---------------------------------------------------------------------------
+# 価格変動（値下げ・スコア改善）通知の重複抑制
+# ---------------------------------------------------------------------------
+#
+# 【背景】
+#   detect_changes は「今日の評価」と「直近の別日の評価」を比較する設計
+#   のため、1日2回の定期実行の両方で全く同じ差分（例: 07-06→07-07の
+#   値下げ）を検知してしまい、同じ内容が2回通知される事故が実際に
+#   発生した。この事故を受け、「同じ変化（URL＋旧価格→新価格＋
+#   旧スコア→新スコアの組）は一度通知したら再通知しない」仕組みを追加する。
+#
+# 【reference_notifications / sashine_notifications との違い（重要）】
+#   参考枠・指値候補の通知済み記録は「候補を検知した時点」でマーキング
+#   している（LINE送信の成否とは無関係）。しかし値下げ情報は「今しか
+#   使えない情報」であり、LINE送信が失敗したのに「通知済み」として
+#   記録してしまうと、ユーザーは二度とその値下げに気づけなくなる。
+#   このため価格変動通知だけは意図的に別方式を採る:
+#     - is_price_change_notified : 検知直後のフィルタ用（マーキングはしない）
+#     - mark_price_change_notified : LINE送信が成功した後にのみ呼ぶ
+#   （呼び出し側は scraper.py の notify_line_price_drops を参照）。
+#
+#   detect_changes 自体（何を変化とみなすかの判定ロジック）は変更しない。
+#   ここで追加するのは「検知された変化を、実際に通知するかどうか」の
+#   フィルタ層だけである。
+
+def _init_price_change_table(conn: sqlite3.Connection) -> None:
+    """price_change_notifications テーブルを作る（すでにあれば何もしない）。"""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS price_change_notifications (
+            listing_url   TEXT NOT NULL,     -- 物件の一意キー（SUUMOのURL）
+            change_key    TEXT NOT NULL,     -- "旧価格->新価格|旧スコア->新スコア"
+            notified_date TEXT NOT NULL,     -- 通知した日（"YYYY-MM-DD"）
+            PRIMARY KEY (listing_url, change_key)
+        )
+    """)
+    conn.commit()
+
+
+def _price_change_key(
+    prev_price: Optional[float],
+    today_price: Optional[float],
+    prev_score: Optional[int],
+    today_score: Optional[int],
+) -> str:
+    """
+    「変化の内容」を一意に表す文字列を作る。
+
+    価格・スコアのどちらかが変われば別のキーになるため、後日さらに
+    値下げ・スコア改善が起きた場合は自動的に「新しい変化」として扱われる
+    （同じ変化を繰り返し通知しないための識別子であり、これ自体は
+    detect_changes の閾値判定には関与しない）。
+    """
+    return f"{prev_price}->{today_price}|{prev_score}->{today_score}"
+
+
+def is_price_change_notified(
+    url: str,
+    prev_price: Optional[float],
+    today_price: Optional[float],
+    prev_score: Optional[int],
+    today_score: Optional[int],
+    db_path: Optional[Path] = None,
+) -> bool:
+    """
+    指定の変化内容（URL＋旧価格→新価格＋旧スコア→新スコア）を過去に
+    通知したことがあるかを返す。
+    DB未作成・例外のときは False を返す（例外は出さない。False＝未通知
+    扱いにすることで、記録が読めない場合でも通知自体は継続できる
+    安全側の挙動にしている）。
+
+    db_path: None なら呼び出し時点の DB_PATH を使う。
+    """
+    if db_path is None:
+        db_path = DB_PATH
+    if not db_path.exists():
+        return False
+    key = _price_change_key(prev_price, today_price, prev_score, today_score)
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            _init_price_change_table(conn)
+            row = conn.execute(
+                "SELECT 1 FROM price_change_notifications WHERE listing_url = ? AND change_key = ?",
+                (url, key),
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+    return row is not None
+
+
+def mark_price_change_notified(
+    url: str,
+    prev_price: Optional[float],
+    today_price: Optional[float],
+    prev_score: Optional[int],
+    today_score: Optional[int],
+    db_path: Optional[Path] = None,
+    _today: Optional[str] = None,
+) -> None:
+    """
+    指定の変化内容を通知したことを記録する（UPSERT）。
+
+    ⚠ 呼び出しタイミングが重要: この関数は LINE 送信が成功した後にのみ
+    呼ぶこと。検知した時点で呼んでしまうと、送信が失敗した場合に
+    「通知済みだが実際は届いていない」状態になり、値下げ情報という
+    「今しか使えない情報」を永久にユーザーへ届けられなくなる。
+
+    DB書き込みに失敗しても例外は投げない（通知自体は既に送信済みのため、
+    記録の失敗だけで処理全体を止める必要はない）。
+
+    db_path: None なら呼び出し時点の DB_PATH を使う。
+    """
+    if db_path is None:
+        db_path = DB_PATH
+    today = _today or date.today().isoformat()
+    key = _price_change_key(prev_price, today_price, prev_score, today_score)
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            _init_price_change_table(conn)
+            conn.execute(
+                """
+                INSERT INTO price_change_notifications (listing_url, change_key, notified_date)
+                VALUES (?, ?, ?)
+                ON CONFLICT(listing_url, change_key) DO UPDATE SET
+                    notified_date = excluded.notified_date
+                """,
+                (url, key, today),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        logger.warning("mark_price_change_notified 失敗（通知は既に送信済み）: %s", e)
+
+
+# ---------------------------------------------------------------------------
 # エントリポイント（手動実行・動作確認用）
 # ---------------------------------------------------------------------------
 

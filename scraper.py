@@ -542,31 +542,93 @@ def _build_text_price_drop(alert: dict) -> str:
     return "\n".join(parts)
 
 
-def notify_line_price_drops(alerts: list[dict]) -> None:
-    """値下げ・スコア改善アラートを LINE に一括通知する。"""
+def _price_change_dedup_args(alert: dict) -> tuple:
+    """
+    アラート1件から、evaluator.is_price_change_notified /
+    mark_price_change_notified に渡す引数（url, 旧価格, 新価格, 旧スコア,
+    新スコア）を取り出す。両関数を呼ぶ箇所で同じ抽出ロジックを重複させ
+    ないための共通ヘルパー。
+    """
+    prev  = alert["prev"]
+    today = alert["today"]
+    return (
+        alert["url"],
+        prev.get("asking_price"), today.get("asking_price"),
+        prev.get("resale_score"), today.get("resale_score"),
+    )
+
+
+def _filter_unnotified_price_changes(alerts: list[dict], db_path=None) -> list[dict]:
+    """
+    detect_changes の結果から、既に同じ内容（URL＋旧価格→新価格＋
+    旧スコア→新スコアの組）で通知済みの変化を除外する。
+
+    ここではマーキング（通知済みとして記録すること）は行わない。
+    マーキングは notify_line_price_drops が LINE 送信に成功した後にのみ
+    行う（値下げ情報は「今しか使えない情報」のため、送信失敗時に
+    「通知済みだが実際は届いていない」状態を避ける設計）。
+
+    detect_changes 自体（何を変化とみなすかの判定）はここでは変更しない。
+    このフィルタは detect_changes の呼び出し直後にかけるだけの追加の層。
+    """
+    from evaluator import is_price_change_notified
+    result = []
+    for alert in alerts:
+        url, prev_price, today_price, prev_score, today_score = _price_change_dedup_args(alert)
+        if is_price_change_notified(url, prev_price, today_price, prev_score, today_score, db_path=db_path):
+            continue  # 同じ変化を過去に通知済み → 今回は通知しない
+        result.append(alert)
+    return result
+
+
+def notify_line_price_drops(alerts: list[dict], db_path=None) -> None:
+    """
+    値下げ・スコア改善アラートを LINE に一括通知する。
+
+    LINE送信が成功したバッチに含まれるアラートのみ、通知済みとして
+    マーキングする（mark_price_change_notified）。送信が失敗した
+    バッチのアラートはマーキングされないため、次回の実行で
+    _filter_unnotified_price_changes を通っても除外されず、
+    再度通知が試みられる。
+    """
     if not alerts:
         return
     if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_USER_ID:
         print("[警告] LINE 認証情報が未設定のため価格変動通知をスキップします。", flush=True)
         return
 
-    # ヘッダー + 1件1メッセージで組み立て、_MAX_MESSAGES_PER_CALL 件ずつ送信
+    from evaluator import mark_price_change_notified
+
+    # message_texts[0] はヘッダー行（対応するアラートなし）。
+    # message_texts[i+1] が alerts[i] に対応する。
     message_texts: list[str] = [f"📉 価格変動のお知らせ（{len(alerts)}件）"]
-    for alert in alerts:
-        message_texts.append(_build_text_price_drop(alert))
+    message_texts.extend(_build_text_price_drop(a) for a in alerts)
+    corresponding_alerts: list[Optional[dict]] = [None] + list(alerts)
 
     headers = {
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
     for batch_start in range(0, len(message_texts), _MAX_MESSAGES_PER_CALL):
-        batch = message_texts[batch_start : batch_start + _MAX_MESSAGES_PER_CALL]
+        batch_end   = batch_start + _MAX_MESSAGES_PER_CALL
+        batch       = message_texts[batch_start:batch_end]
+        batch_alerts = corresponding_alerts[batch_start:batch_end]
+
         payload = {
             "to": LINE_USER_ID,
             "messages": [{"type": "text", "text": t} for t in batch],
         }
         resp = requests.post(LINE_API_URL, headers=headers, json=payload, timeout=10)
         print(f"LINE送信結果（価格変動）: {resp.status_code} - {resp.text}", flush=True)
+
+        if resp.status_code == 200:
+            for alert in batch_alerts:
+                if alert is not None:
+                    url, prev_price, today_price, prev_score, today_score = _price_change_dedup_args(alert)
+                    mark_price_change_notified(
+                        url, prev_price, today_price, prev_score, today_score, db_path=db_path,
+                    )
+
         time.sleep(1)
 
 
@@ -1270,6 +1332,9 @@ def main() -> None:
             sashine_candidates = []
 
         price_drop_alerts = detect_changes([l.url for l in current])
+        # 1日2回の定期実行で同じ変化が重複通知される事故を受け、既に同じ
+        # 内容で通知済みの変化を除外する（detect_changes自体は無変更）。
+        price_drop_alerts = _filter_unnotified_price_changes(price_drop_alerts)
         # est_map は参考枠（既知物件を含む）でも使うため current 全件に拡大する。
         # notify_line_two_stage は scored（new_listings由来のみ）しか参照しない
         # ため、この拡大は既存の2段階通知の挙動に影響しない。
