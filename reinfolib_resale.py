@@ -300,6 +300,10 @@ class ResaleEstimate:
     # 呼び出し側（select_curve）が決めた説明文字列をそのまま記録するだけで、
     # このモジュール自身は地区/市の判定ロジックを持たない。
     curve_source: str = ""
+    # 評価基準年時点での築年数（current_year - building_year）。
+    # 通知側で「現在築○年」を表示するために保持するだけで、スコア計算等の
+    # 判定には使わない（既存のスコアリングは変更しない）。
+    current_age: Optional[int] = None
 
 
 # 譲渡所得税: 所有5年以下=短期39.63% / 5年超=長期20.315%
@@ -355,6 +359,7 @@ def estimate_resale(
         resale_score=score,
         notes=notes,
         curve_source=curve_source,
+        current_age=current_age,
     )
 
 

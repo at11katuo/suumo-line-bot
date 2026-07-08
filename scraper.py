@@ -35,6 +35,12 @@ DATA_FILE = "data.csv"
 # 異常に長時間化する事故が実際に発生したための安全策。
 GEMINI_EVAL_LIMIT_PER_RUN = 8
 
+# 「現在築○年」表示で注記を添える築年数のしきい値。
+# 保有期間が長いほど将来の売却額の目減りが大きくなりやすいという
+# 傾向を、精密な計算なしに一言で注意喚起するためのもの
+# （ローン残債等ユーザー固有の前提を要する断定的な計算は行わない）。
+AGE_WARNING_THRESHOLD_YEARS = 15
+
 # 検索URLは環境変数で上書き可能
 # 対象: 調布市・府中市 / 中古マンション / 4000〜5500万円
 # ※徒歩・面積・築年数フィルターはURLパラメータ非対応のためPythonで後処理
@@ -668,6 +674,50 @@ def _format_listing_age(age_days: Optional[int]) -> Optional[str]:
     return f"確認してから {age_days}日目"
 
 
+def _current_age_from_est(est: dict) -> Optional[int]:
+    """
+    DB行（est_map[url]。evaluator.load_evaluations_today 等の戻り値）から
+    現在の築年数を計算する。
+    building_year（建築年）・evaluated_date（評価日 "YYYY-MM-DD"）の
+    どちらかが欠けている、または不正な形式のときは None を返す
+    （呼び出し側で「行を出さない」判断に使う。例外は投げない）。
+
+    reinfolib_resale.ResaleEstimate.current_age と同じ計算
+    （評価基準年 - building_year）だが、est は DB 由来の dict のため
+    別途ここで計算する（sashine.py 経路は ResaleEstimate.current_age を
+    直接使うため、この関数を経由しない）。
+    """
+    building_year = est.get("building_year")
+    evaluated_date = est.get("evaluated_date")
+    if not building_year or not evaluated_date:
+        return None
+    try:
+        evaluated_year = int(str(evaluated_date)[:4])
+        return evaluated_year - int(building_year)
+    except (ValueError, TypeError):
+        return None
+
+
+def _build_age_line(current_age: Optional[int], include_warning: bool = True) -> Optional[str]:
+    """
+    「現在築○年」の表示行を作る。current_age が None のときは None を返し、
+    呼び出し側で「行を出さない」判断に使う。
+
+    AGE_WARNING_THRESHOLD_YEARS 以上のときは、保有期間が長いほど売却額の
+    目減りが大きくなりやすい旨の注記を続けて添える（断定はせず注意喚起のみ。
+    ローン残債等ユーザー固有の前提を要する計算は一切行わない）。
+
+    include_warning: False のときは閾値を超えていても注記を付けない
+    （指値候補など、既に情報量が多い通知で簡潔に留めたい場合に使う）。
+    """
+    if current_age is None:
+        return None
+    line = f"現在築{current_age}年"
+    if include_warning and current_age >= AGE_WARNING_THRESHOLD_YEARS:
+        line += "\n⚠ 保有期間が長いほど売却額の目減りが大きくなりやすい築年数です"
+    return line
+
+
 def _build_text_promising(
     listing: Listing,
     eval_text: str,
@@ -694,6 +744,9 @@ def _build_text_promising(
     if vs_fair is not None:
         direction = "割安" if vs_fair <= 0 else "割高"
         parts.append(f"実勢比          : {vs_fair:+.1f}%（{direction}）")
+    age_line = _build_age_line(_current_age_from_est(est))
+    if age_line:
+        parts.append(age_line)
     if future is not None:
         parts.append(f"{hold_years}年後 想定売却額: 約{future / 10_000:.0f}万円")
 
@@ -761,6 +814,15 @@ def _build_text_compact(
             data_bits.append(f"実勢比 {vs_fair:+.1f}%（{direction}）")
         if data_bits:
             parts.append(f"  データ評価: {' ・ '.join(data_bits)}")
+
+        age_line = _build_age_line(_current_age_from_est(est))
+        if age_line:
+            parts.append("  " + age_line.replace("\n", "\n  "))
+
+        future = est.get("future_resale_price")
+        if future is not None:
+            hold_years = est.get("hold_years", 10)
+            parts.append(f"  {hold_years}年後 想定売却額: 約{future / 10_000:.0f}万円")
 
     # Gemini 評価テキストから「懸念点：xxx」の行だけ抜き出して添える。
     # 全角／半角コロン両対応。`.` は改行を含まないので懸念点の1行だけ取得する。
@@ -901,6 +963,15 @@ def _build_text_reference(
         data_bits.append(f"実勢比 {vs_fair:+.1f}%（{direction}）")
     if data_bits:
         parts.append(f"  データ評価: {' ・ '.join(data_bits)}")
+
+    building_age_line = _build_age_line(_current_age_from_est(est))
+    if building_age_line:
+        parts.append("  " + building_age_line.replace("\n", "\n  "))
+
+    future = est.get("future_resale_price")
+    if future is not None:
+        hold_years = est.get("hold_years", 10)
+        parts.append(f"  {hold_years}年後 想定売却額: 約{future / 10_000:.0f}万円")
 
     # AI（Gemini）の判断を必ず併記。★数と懸念点で「なぜ自動抽出外だったか」を示す（過信防止）。
     if gemini_score >= 1:
@@ -1093,6 +1164,17 @@ def _build_text_sashine(
         parts.append(f"  {age_line} → 強気度: {agg_label}")
     else:
         parts.append(f"  強気度: {agg_label}")
+
+    # 現在築年数（注記は既に情報量が多いため省略し、簡潔に1行だけ添える）
+    building_age_line = _build_age_line(est_now.current_age, include_warning=False)
+    if building_age_line:
+        parts.append(f"  {building_age_line}")
+
+    # 想定売却額（強調版・控えめ版・参考枠と表示形式を統一）
+    if est_now.future_resale_price is not None:
+        from evaluator import DEFAULT_HOLD_YEARS  # 循環インポート回避
+        future_man = est_now.future_resale_price / 10_000
+        parts.append(f"  {DEFAULT_HOLD_YEARS}年後 想定売却額: 約{future_man:.0f}万円")
 
     parts.append("  --- 指値目安 ---")
     opening_man = targets["opening_offer"]   / 10_000
