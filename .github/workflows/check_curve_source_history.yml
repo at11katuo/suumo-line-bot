@@ -1,0 +1,51 @@
+name: 【診断専用・手動のみ】curve_source履歴確認
+
+# ============================================================
+# このワークフローの目的:
+#   本番のDB（evaluations.db）は actions/cache 内にのみ存在し、
+#   ローカルファイルからは中身を確認できない。
+#   紅葉丘2グループ（横断重複の実例）の各URLについて、
+#   curve_source（district/cityどちらのカーブを使ったか）・
+#   適正㎡単価・実勢比の日別推移を読み取り専用で確認するための、
+#   診断専用ワークフロー（inspect_detail_cache.yml と同じパターン）。
+#
+# 安全設計:
+#   - workflow_dispatch（手動実行）のみ。スケジュール実行はしない。
+#   - actions/cache/restore（restore専用サブアクション）を使う。
+#     通常の actions/cache と違い、ジョブ終了時の自動保存が発生しない
+#     ため、本当に読み取り専用のまま終わる（キャッシュへの書き戻しなし）。
+#   - permissions は contents: read のみ（書き込み権限を一切持たない）。
+#   - SUUMOへのアクセス・LINE通知・data.csvの変更は一切行わない。
+# ============================================================
+
+on:
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python セットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          # sqlite3・pathlib は標準ライブラリのみ使用のため pip install 不要
+
+      - name: DB・カーブキャッシュ復元（読み取り専用・保存しない）
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            evaluations.db
+            cache
+          key: suumo-eval-db-readonly-check-noop
+          restore-keys: |
+            suumo-eval-db-
+
+      - name: curve_source 履歴を確認（読み取り専用）
+        run: python check_curve_source_history.py
