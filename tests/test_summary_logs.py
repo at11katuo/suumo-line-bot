@@ -88,8 +88,9 @@ class TestDetailFetchSummaryLog:
         self, main_env, monkeypatch, capsys,
     ):
         # 新着2件、両方とも新規fetchで成功 → 母数と内訳が正しく出る
+        # （横断重複グルーピングで誤って1件に集約されないよう、location を分ける）
         listing_a = make_listing(url="https://suumo.jp/test/summary-a/")
-        listing_b = make_listing(url="https://suumo.jp/test/summary-b/")
+        listing_b = make_listing(url="https://suumo.jp/test/summary-b/", location="東京都府中市本町１")
         monkeypatch.setattr(scraper, "scrape", lambda url: [listing_a, listing_b])
         monkeypatch.setattr(scraper, "evaluate_listing", lambda l: (0, ""))
         monkeypatch.setattr(
@@ -111,8 +112,9 @@ class TestDetailFetchSummaryLog:
         self, main_env, monkeypatch,
     ):
         # 新着2件のうち1件は取得失敗(None) → 成功/失敗が分けて出る
+        # （横断重複グルーピングで誤って1件に集約されないよう、location を分ける）
         listing_a = make_listing(url="https://suumo.jp/test/summary-c/")
-        listing_b = make_listing(url="https://suumo.jp/test/summary-d/")
+        listing_b = make_listing(url="https://suumo.jp/test/summary-d/", location="東京都府中市本町１")
         monkeypatch.setattr(scraper, "scrape", lambda url: [listing_a, listing_b])
         monkeypatch.setattr(scraper, "evaluate_listing", lambda l: (0, ""))
 

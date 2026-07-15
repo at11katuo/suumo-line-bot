@@ -70,11 +70,11 @@ _FIXED_CURVE = DepreciationCurve(
 )
 
 
-def make_listing(name: str, price: str, url: str) -> Listing:
+def make_listing(name: str, price: str, url: str, location: str = "東京都調布市曙町") -> Listing:
     return Listing(
         name=name,
         price=price,
-        location="東京都調布市曙町",
+        location=location,
         url=url,
         station="京王線 調布駅 徒歩6分",
         floor_plan="3LDK",
@@ -146,14 +146,28 @@ class TestSashineFailureDoesNotBlockExistingNotifications:
         db_path = main_env
 
         # --- 4種類の通知をそれぞれ発火させる物件を用意 ---
+        # 横断重複グルーピング（location+area+floor_plan+age）で誤って
+        # 1件に集約されないよう、location をそれぞれ変えて別物件にする。
         # 強調版: Gemini★5 かつ reinfolib有望(乖離率-4.76%, score75)
-        promising = make_listing("強調版物件", "4,800万円", "https://suumo.jp/test/main-promising/")
+        promising = make_listing(
+            "強調版物件", "4,800万円", "https://suumo.jp/test/main-promising/",
+            location="東京都調布市曙町１",
+        )
         # 控えめ版: Gemini★4 だが reinfolib非有望(乖離率+9.13%)
-        normal = make_listing("控えめ版物件", "5,500万円", "https://suumo.jp/test/main-normal/")
+        normal = make_listing(
+            "控えめ版物件", "5,500万円", "https://suumo.jp/test/main-normal/",
+            location="東京都調布市曙町２",
+        )
         # 参考枠: Gemini★2(4未満) だが reinfolib有望(乖離率-3.77%)
-        rejected_promising = make_listing("参考枠物件", "4,850万円", "https://suumo.jp/test/main-rejected/")
+        rejected_promising = make_listing(
+            "参考枠物件", "4,850万円", "https://suumo.jp/test/main-rejected/",
+            location="東京都調布市曙町３",
+        )
         # 値下げ: 前日4,500万円→本日4,000万円（500万円の下落、閾値50万円を超過）
-        price_drop = make_listing("値下げ物件", "4,000万円", "https://suumo.jp/test/main-pricedrop/")
+        price_drop = make_listing(
+            "値下げ物件", "4,000万円", "https://suumo.jp/test/main-pricedrop/",
+            location="東京都調布市曙町４",
+        )
 
         all_listings = [promising, normal, rejected_promising, price_drop]
 

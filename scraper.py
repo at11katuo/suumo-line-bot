@@ -386,6 +386,9 @@ def evaluate_listing(listing: Listing) -> tuple[int, str]:
 
     client = genai.Client(api_key=GEMINI_API_KEY)
 
+    age_years = _parse_age_years(listing.age)  # 既存関数を流用、唯一の真実
+    age_fact = f"{age_years}年" if age_years is not None else "不明"
+
     prompt = "\n".join([
         f"物件名: {listing.name}",
         f"価格: {listing.price}",
@@ -394,6 +397,7 @@ def evaluate_listing(listing: Listing) -> tuple[int, str]:
         f"間取り: {listing.floor_plan or '不明'}",
         f"専有面積: {listing.area or '不明'}",
         f"築年月: {listing.age or '不明'}",
+        f"【確定事実】築年数: {age_fact}（Pythonが計算済み。本文中で言及する際は必ずこの値を使い、独自に再計算しないこと）",
     ])
 
     max_retries = 3
@@ -409,6 +413,10 @@ def evaluate_listing(listing: Listing) -> tuple[int, str]:
             text = response.text.strip()
             m = re.search(r'\((\d)/5\)', text)
             score = int(m.group(1)) if m else 0
+
+            if age_years is not None:
+                text = _validate_age_consistency(text, age_years, listing.name)
+
             print(f"  [AI] {score}★ {listing.name[:25]}", flush=True)
             return (score, text)
         except Exception as e:
@@ -417,6 +425,17 @@ def evaluate_listing(listing: Listing) -> tuple[int, str]:
                 print("  [リトライ] 60秒待機後に再試行します...", flush=True)
                 time.sleep(60)
     return (0, "")
+
+
+def _validate_age_consistency(text: str, age_years: int, listing_name: str = "") -> str:
+    """テキスト全体（総合評価/メリット/懸念点/ポテンシャル/判定を含む1本のブロック）
+    に含まれる「築◯年」がage_yearsと矛盾していれば是正する。"""
+    pattern = re.compile(r'築\s*(\d+)\s*年')
+    mismatches = [int(m) for m in pattern.findall(text) if int(m) != age_years]
+    if mismatches:
+        print(f"  [警告][age_mismatch] {listing_name[:20]} Gemini記載={mismatches} 正={age_years}", flush=True)
+        text = pattern.sub(f"築{age_years}年", text)
+    return text
 
 
 # ------------------------------------------------------------------ #
@@ -545,7 +564,112 @@ def _build_text_price_drop(alert: dict) -> str:
         f"  前回  : {prev.get('evaluated_date', '?')} / "
         f"今回: {today.get('evaluated_date', '?')}"
     )
+    dual_note = alert.get("dual_note")
+    if dual_note:
+        parts.append(f"  {dual_note}")
     return "\n".join(parts)
+
+
+# ------------------------------------------------------------------ #
+# 値下げ通知のグループ単位化（横断重複グループの追従値下げ二重通知防止）
+# ------------------------------------------------------------------ #
+
+def aggregate_alerts_by_group(
+    alerts: list[dict],
+    current_listings: list[Listing],
+    db_path=None,
+) -> list[dict]:
+    """
+    detect_changes の結果（URL単位アラート）を横断重複グループ単位に集約する。
+
+    「グループ最安値（今日）< グループ最安値（前回）」のときだけ1件のアラートを
+    残す。片方が値下げして通知した後、もう片方が追従値下げしてグループ最安値が
+    動かない場合は再通知しない（ミオカステーロの実例で要求された挙動）。
+
+    グループ内の全メンバーの今日/前回価格が必要なため（追従値下げのケースを
+    正しく判定するには「値下げしていない側」の前回価格も要る）、対象グループの
+    全URLに対して detect_changes を閾値を極端に緩めて再呼び出しし、今日/前回の
+    ペアを取得する。detect_changes 自体のロジック・シグネチャは変更しない
+    （責務分離を維持しつつ、既存関数をそのまま再利用するだけ）。
+
+    戻り値の各アラートには以下を追加する:
+        "dual_note"            : format_dual_listing_note の結果（1件なら空文字）
+        "group_urls"           : グループの全URL（通知後の一括マーキング用）
+        "group_members_history": {url: {"today": dict, "prev": dict}}
+                                  （通知後、URLごとに自分自身の値でマーキングするため）
+    """
+    if not alerts:
+        return []
+
+    from listing_group import group_listings, merge_similar_groups, format_dual_listing_note
+    from evaluator import detect_changes
+
+    # detect_changes を再呼び出しする際、テスト等で _today が固定されている
+    # ケースに対応するため、元のアラート自身が使った evaluated_date を引き継ぐ
+    # （省略すると実際の date.today() で再照会してしまい、固定日付のテストで
+    # ズレて 0 件になる）。同一バッチ内の alerts は全て同じ _today で
+    # 生成されている前提（main() では detect_changes を1回だけ呼ぶため常に成立）。
+    today_date = alerts[0]["today"].get("evaluated_date")
+
+    alerted_urls = {a["url"] for a in alerts}
+    groups = merge_similar_groups(group_listings(current_listings))
+
+    aggregated: list[dict] = []
+    for members in groups.values():
+        member_urls = [m.url for m in members]
+        if not (set(member_urls) & alerted_urls):
+            continue  # このグループにアラート対象のURLがない → 対象外
+
+        if len(members) == 1:
+            # 単独物件（重複なし）はグループ判定不要。既存のアラートをそのまま通す。
+            hit = next((a for a in alerts if a["url"] == member_urls[0]), None)
+            if hit is not None:
+                hit = dict(hit)
+                hit["dual_note"] = ""
+                hit["group_urls"] = member_urls
+                hit["group_members_history"] = {}
+                aggregated.append(hit)
+            continue
+
+        # グループ内全メンバーの today/prev を取得（閾値を極端に緩めて全件拾う）
+        full_history = detect_changes(
+            member_urls, db_path=db_path, _today=today_date,
+            min_price_drop=-10**15, min_score_gain=-10**15,
+        )
+        history_by_url = {h["url"]: h for h in full_history}
+        if not history_by_url:
+            continue
+
+        today_rows = [h["today"] for h in history_by_url.values() if h["today"].get("asking_price") is not None]
+        prev_rows  = [h["prev"]  for h in history_by_url.values() if h["prev"].get("asking_price")  is not None]
+        if not today_rows or not prev_rows:
+            continue
+
+        today_row_at_min = min(today_rows, key=lambda r: r["asking_price"])
+        prev_row_at_min  = min(prev_rows,  key=lambda r: r["asking_price"])
+        group_min_today  = today_row_at_min["asking_price"]
+        group_min_prev   = prev_row_at_min["asking_price"]
+
+        if not (group_min_today < group_min_prev):
+            continue  # グループ最安値が動いていない（追従値下げのみ等）→ 通知しない
+
+        t_score = today_row_at_min.get("resale_score")
+        p_score = prev_row_at_min.get("resale_score")
+        score_gain = (t_score - p_score) if (t_score is not None and p_score is not None) else 0
+
+        aggregated.append({
+            "url":                    today_row_at_min["listing_url"],
+            "name":                   today_row_at_min.get("listing_name", ""),
+            "today":                  today_row_at_min,
+            "prev":                   prev_row_at_min,
+            "price_drop":             round(group_min_prev - group_min_today),
+            "score_gain":             score_gain,
+            "dual_note":              format_dual_listing_note(members),
+            "group_urls":             member_urls,
+            "group_members_history":  {h["url"]: {"today": h["today"], "prev": h["prev"]} for h in history_by_url.values()},
+        })
+
+    return aggregated
 
 
 def _price_change_dedup_args(alert: dict) -> tuple:
@@ -629,7 +753,21 @@ def notify_line_price_drops(alerts: list[dict], db_path=None) -> None:
 
         if resp.status_code == 200:
             for alert in batch_alerts:
-                if alert is not None:
+                if alert is None:
+                    continue
+                # 横断重複グループのアラートは、代表URLだけでなくグループ内の
+                # 全URLをそれぞれ自分自身の今日/前回の値でマーキングする
+                # （片方の追従値下げで再び group アラートが発火しないように）。
+                group_history = alert.get("group_members_history")
+                if group_history:
+                    for member_url, h in group_history.items():
+                        mark_price_change_notified(
+                            member_url,
+                            h["prev"].get("asking_price"), h["today"].get("asking_price"),
+                            h["prev"].get("resale_score"), h["today"].get("resale_score"),
+                            db_path=db_path,
+                        )
+                else:
                     url, prev_price, today_price, prev_score, today_score = _price_change_dedup_args(alert)
                     mark_price_change_notified(
                         url, prev_price, today_price, prev_score, today_score, db_path=db_path,
@@ -725,6 +863,7 @@ def _build_text_promising(
     idx: int,
     age_days: Optional[int] = None,
     gemini_score: Optional[int] = None,
+    dual_note: str = "",
 ) -> str:
     """強調版メッセージ（有望物件用）。reinfolib の評価数値を冒頭に差し込む。"""
     hold_years = est.get("hold_years", 10)
@@ -763,6 +902,10 @@ def _build_text_promising(
     age_line = _format_listing_age(age_days)
     if age_line:
         parts.append(age_line)
+    # 新着通知なのに観測日数が長い（=再掲載検知の対象外＝URL転用の可能性）
+    # ケースへの保険（STEP 2.5-d）。
+    if age_days is not None and age_days >= RELIST_AGE_WARNING_DAYS:
+        parts.append(f"⚠ 初回観測から{age_days}日経過（再掲載またはURL転用の可能性）")
     parts.append("――――――――――")
 
     for line in eval_text.splitlines():
@@ -775,6 +918,8 @@ def _build_text_promising(
         pass
 
     parts.append(f"URL  : {listing.url}")
+    if dual_note:
+        parts.append(dual_note)
     return "\n".join(parts)
 
 
@@ -785,6 +930,7 @@ def _build_text_compact(
     age_days: Optional[int] = None,
     gemini_score: Optional[int] = None,
     est: Optional[dict] = None,
+    dual_note: str = "",
 ) -> str:
     """控えめ版メッセージ（通常物件・評価スキップ物件用）。
     物件名・価格・駅徒歩・URL に加え、Gemini の★数・reinfolibのスコア/
@@ -835,8 +981,14 @@ def _build_text_compact(
     age_line = _format_listing_age(age_days)
     if age_line:
         parts.append(f"  {age_line}")
+    # 新着通知なのに観測日数が長い（=再掲載検知の対象外＝URL転用の可能性）
+    # ケースへの保険（STEP 2.5-d）。
+    if age_days is not None and age_days >= RELIST_AGE_WARNING_DAYS:
+        parts.append(f"  ⚠ 初回観測から{age_days}日経過（再掲載またはURL転用の可能性）")
 
     parts.append(f"  URL: {listing.url}")
+    if dual_note:
+        parts.append(f"  {dual_note}")
     return "\n".join(parts)
 
 
@@ -847,6 +999,7 @@ def notify_line_two_stage(
     scored: list[tuple[Listing, str]],
     est_map: dict[str, dict],
     gemini_score_map: Optional[dict[str, int]] = None,
+    dual_note_map: Optional[dict[str, str]] = None,
 ) -> None:
     """
     2段階LINE通知。
@@ -857,6 +1010,8 @@ def notify_line_two_stage(
     gemini_score_map: 物件URL → Gemini★数。scored（4★以上）は本来常に
                       値を持つはずだが、未指定・URLが無い場合は該当物件の
                       「AI評価」行を省略するだけで通知自体は止めない。
+    dual_note_map: 物件URL → listing_group.format_dual_listing_note の結果。
+                   横断重複グループの代表物件にのみ入る想定（通常は空）。
     """
     if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_USER_ID:
         print("[警告] LINE 認証情報が未設定のため通知をスキップします。", flush=True)
@@ -865,6 +1020,8 @@ def notify_line_two_stage(
     # ミュータブルなデフォルト引数を避けるため、呼び出しごとにここで解決する
     if gemini_score_map is None:
         gemini_score_map = {}
+    if dual_note_map is None:
+        dual_note_map = {}
 
     # 各物件の「観測開始からの日数」を DB 履歴から引く。
     # DBなし・履歴なし・例外は None（＝表示しない）になり、通知は止めない。
@@ -891,6 +1048,7 @@ def notify_line_two_stage(
                 listing, eval_text, est_map.get(listing.url, {}), rank,
                 age_days=age_map.get(listing.url),
                 gemini_score=gemini_score_map.get(listing.url),
+                dual_note=dual_note_map.get(listing.url, ""),
             )
         )
 
@@ -900,6 +1058,7 @@ def notify_line_two_stage(
             _build_text_compact(
                 l, offset + i + 1, eval_text, age_days=age_map.get(l.url),
                 gemini_score=gemini_score_map.get(l.url), est=est_map.get(l.url),
+                dual_note=dual_note_map.get(l.url, ""),
             )
             for i, (l, eval_text) in enumerate(normal)
         ]
@@ -921,6 +1080,218 @@ def notify_line_two_stage(
         resp = requests.post(LINE_API_URL, headers=headers, json=payload, timeout=10)
         print(f"LINE送信結果: {resp.status_code} - {resp.text}", flush=True)
         time.sleep(1)
+
+
+# ------------------------------------------------------------------ #
+# 別業者掲載検知通知（横断重複グループのうち、既知×新規が混在するもの）
+#   ※ フル新着通知（AI評価・データ評価付き）は送らない短文専用の枠。
+#      Gemini新規API呼び出しは発生しない（呼び出し元 main() 側で
+#      既知物件のキャッシュ済み評価をコピーする）。
+# ------------------------------------------------------------------ #
+
+def _build_text_dual_listing_detected(new_listing: Listing, known_listing: Listing) -> str:
+    """1件分の短文（新規側と、グループ内の既知側の今回価格を併記）。
+    「🔁 既知物件の別業者掲載を検知」という文言はヘッダー行
+    （notify_line_dual_listing_detected）側にのみ出し、1件だけの通知でも
+    冗長にならないようにする。"""
+    return "\n".join([
+        f"【{new_listing.name}】",
+        f"  {new_listing.price}（新規） vs {known_listing.price}（既知）",
+        f"  URL: {new_listing.url}",
+    ])
+
+
+def notify_line_dual_listing_detected(alerts: list[dict]) -> None:
+    """
+    alerts: [{"new": Listing, "known": Listing}, ...]
+    横断重複グループ内で、既に既知物件として登録済みのURLと同一物件と
+    判定された新規URLをまとめて短文通知する。AI評価・データ評価は付けない
+    （フル新着通知＝notify_line_two_stageとは別枠）。
+    """
+    if not alerts:
+        return
+    if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_USER_ID:
+        print("[警告] LINE 認証情報が未設定のため通知をスキップします。", flush=True)
+        return
+
+    header = f"🔁 既知物件の別業者掲載を検知（{len(alerts)}件）"
+    body = "\n\n".join(
+        _build_text_dual_listing_detected(a["new"], a["known"]) for a in alerts
+    )
+    notify_line_text(f"{header}\n\n{body}")
+
+
+# ------------------------------------------------------------------ #
+# 再掲載検知（STEP 2.5）
+#   data.csv 上書き保存によって「既知URL」の実体が「前回検索結果にいた
+#   URLの集合」でしかなくなる設計穴を、evaluations の観測履歴で塞ぐ。
+#   同時に、URL使い回し（同一URLで別物件に差し替わるケース）への防御として
+#   area_sqm・building_year・floor_plan の3属性一致で同一物件かを判定する。
+# ------------------------------------------------------------------ #
+
+# 再掲載判定の面積許容誤差（㎡）。listing_group.merge_similar_groups と
+# 同じ許容誤差を使う（表記ゆれ・丸め誤差の吸収）。
+_RELIST_AREA_TOLERANCE = 0.05
+
+# 「確認してから」がこの日数以上なのに新着として通知されようとしている場合、
+# 再掲載またはURL転用の可能性を示す注記を自動付与する（STEP 2.5-d）。
+RELIST_AGE_WARNING_DAYS = 7
+
+
+def _attrs_match(listing: Listing, prev: dict) -> bool:
+    """
+    listing（今回のスクレイプ結果）と prev（evaluator.get_last_observed_attrs
+    の戻り値）が同一物件とみなせるかを判定する。
+
+    比較キーは area_sqm・building_year・floor_plan の3点（価格・物件名は
+    比較しない。価格は値下げで、名前は業者のキャッチコピー変更で正当に
+    変わるため）。いずれかの属性が両側とも比較可能な場合のみそのキーを
+    判定に使い、両側とも比較不能なキーはスキップする。1つも比較できる
+    キーがなければ安全側（新着扱い＝不一致）に倒して False を返す。
+    """
+    from listing_group import _normalize_area, _normalize_age, _normalize_floor_plan
+
+    area_str = _normalize_area(listing.area)
+    area_val = float(area_str) if area_str else None
+
+    age_str = _normalize_age(listing.age)
+    building_year = int(age_str.split("-")[0]) if age_str else None
+
+    floor_plan = _normalize_floor_plan(listing.floor_plan) or None
+    prev_floor_plan = _normalize_floor_plan(prev["floor_plan"]) if prev.get("floor_plan") else None
+
+    checks: list[bool] = []
+    if area_val is not None and prev.get("area_sqm") is not None:
+        checks.append(abs(area_val - prev["area_sqm"]) < _RELIST_AREA_TOLERANCE)
+    if building_year is not None and prev.get("building_year") is not None:
+        checks.append(building_year == prev["building_year"])
+    if floor_plan is not None and prev_floor_plan is not None:
+        checks.append(floor_plan == prev_floor_plan)
+
+    if not checks:
+        return False  # 全属性が比較不能 → 安全側で不一致（新着）扱い
+    return all(checks)
+
+
+def classify_relisting(
+    current: list[Listing],
+    known_urls: set[str],
+    db_path=None,
+) -> tuple[list[Listing], list[tuple[Listing, dict]], list[str]]:
+    """
+    current のうち known_urls（data.csv由来）に無いものを、evaluations の
+    観測履歴で「本当に初見」「再掲載」「URL使い回し」に仕分ける（STEP 2.5）。
+
+    戻り値:
+        candidates : 本当に初見 + URL使い回し（下流で新着として扱う対象）
+        relisted   : [(Listing, evaluator.get_last_observed_attrs の戻り値), ...]
+                     （同一物件の再出現と判定されたもの）
+        url_reused_urls: URL使い回しと判定されたURL一覧（ログ・集計用）
+
+    URL使い回し（属性不一致）と判定した場合は [警告][url_reused] をその場で
+    ログに出す（見逃し防止のため「新着」として扱いつつ、目視で追えるように）。
+    """
+    from evaluator import get_last_observed_attrs
+
+    candidates: list[Listing] = []
+    relisted: list[tuple[Listing, dict]] = []
+    url_reused_urls: list[str] = []
+
+    for l in current:
+        if l.url in known_urls:
+            continue  # data.csv に現存 → 通常の既知物件（対象外）
+        prev = get_last_observed_attrs(l.url, db_path=db_path)
+        if prev is None:
+            candidates.append(l)  # 本当に初見
+        elif _attrs_match(l, prev):
+            relisted.append((l, prev))  # 再掲載（同一物件の再出現）
+        else:
+            # 属性不一致 → 同一URLで別物件に差し替わった可能性（URL使い回し）。
+            # SUUMOのnc_ IDが再利用されない保証は外部仕様上ないため、実測できる
+            # 防御として警告ログを出しつつ「新着」として扱う（見逃し防止）。
+            candidates.append(l)
+            url_reused_urls.append(l.url)
+            print(
+                f"  [警告][url_reused] {l.url} 属性不一致 "
+                f"(面積 {prev['area_sqm']} / 築年 {prev['building_year']} が前回観測時と不一致)",
+                flush=True,
+            )
+
+    return candidates, relisted, url_reused_urls
+
+
+def _build_text_relisted(listing: Listing, prev: dict, idx: int) -> str:
+    """再掲載1件分の本文を組み立てる。"""
+    from listing_group import _parse_price_man_yen
+
+    parts = [f"【{idx}】{listing.name}"]
+
+    today_price_man = _parse_price_man_yen(listing.price)
+    prev_price_yen  = prev.get("asking_price")
+    price_line = f"  {listing.price}"
+    if prev_price_yen is not None and today_price_man != float("inf"):
+        prev_price_man = prev_price_yen / 10_000
+        diff_man = prev_price_man - today_price_man
+        if diff_man > 0:
+            price_line += f"（前回観測時: {prev_price_man:.0f}万円 → 実質値下げ ↓{diff_man:.0f}万円）"
+        else:
+            price_line += f"（前回観測時: {prev_price_man:.0f}万円）"
+    parts.append(price_line)
+
+    import datetime
+    first_date = prev.get("first_date")
+    last_date  = prev.get("last_date")
+    if first_date:
+        try:
+            days_ago = (datetime.date.today() - datetime.date.fromisoformat(first_date)).days
+            parts.append(f"  初回観測: {first_date}（{days_ago}日前） / 前回消滅推定: {last_date}")
+        except ValueError:
+            parts.append(f"  初回観測: {first_date} / 前回消滅推定: {last_date}")
+
+    parts.append(f"  URL: {listing.url}")
+    return "\n".join(parts)
+
+
+def notify_line_relisted(relisted: list[tuple[Listing, dict]], db_path=None) -> None:
+    """
+    relisted: [(Listing, prev_attrs_dict), ...]
+    （prev_attrs_dict は evaluator.get_last_observed_attrs の戻り値）
+
+    再掲載（一度data.csvから消えて再出現した既知物件）を短文通知する。
+    フル新着通知（AI評価・データ評価付き）は送らない。同一URLの
+    「同じ消滅サイクル（last_date）からの再出現」は1回だけ通知する。
+
+    db_path: None なら呼び出し時点の evaluator.DB_PATH を使う（テストで
+             一時DBに差し替えられるよう、他の notify_line_* 関数と同じ
+             パターンでそのまま is_relisted_notified/mark_relisted_notified
+             に渡す）。
+    """
+    if not relisted:
+        return
+    if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_USER_ID:
+        print("[警告] LINE 認証情報が未設定のため通知をスキップします。", flush=True)
+        return
+
+    from evaluator import is_relisted_notified, mark_relisted_notified
+
+    to_notify = [
+        (listing, prev) for listing, prev in relisted
+        if not (prev.get("last_date") and is_relisted_notified(listing.url, prev["last_date"], db_path=db_path))
+    ]
+    if not to_notify:
+        return
+
+    header = f"🔁 再掲載を検知（{len(to_notify)}件）"
+    body = "\n\n".join(
+        _build_text_relisted(listing, prev, i)
+        for i, (listing, prev) in enumerate(to_notify, start=1)
+    )
+    notify_line_text(f"{header}\n\n{body}")
+
+    for listing, prev in to_notify:
+        last_date = prev.get("last_date")
+        if last_date:
+            mark_relisted_notified(listing.url, last_date, db_path=db_path)
 
 
 # ------------------------------------------------------------------ #
@@ -1337,8 +1708,85 @@ def main() -> None:
 
     # 差分比較
     known_urls = load_known_urls(DATA_FILE)
-    new_listings = [l for l in current if l.url not in known_urls]
-    print(f"新着: {len(new_listings)} 件 (既知: {len(known_urls)} 件)", flush=True)
+
+    # ── 再掲載検知（STEP 2.5）──────────────────────────────────────────
+    # data.csv は毎回スクレイプ結果で上書き保存されるため、「既知URL」の実体は
+    # 「前回検索結果にいたURL」でしかない。検索結果から一時的に消えて再出現
+    # すると data.csv 上の既知情報が消え、再出現時に新着扱いになってしまう
+    # （是政の物件で実際に確認された不具合）。evaluations の観測履歴
+    # （MIN/MAXのevaluated_date）は data.csv の上書きに影響されないため、
+    # classify_relisting で「本当に初見」「再掲載」「URL使い回し」を判定する。
+    _new_candidates, relisted, _url_reused_urls = classify_relisting(current, known_urls)
+
+    # 再掲載URLは、横断重複グルーピング上「既知」として扱う（別業者掲載検知や
+    # フル新着パイプラインに乗せない）。url_reused は逆に「新着」のまま扱う
+    # （genuinely_new と同じ経路。既に known_urls に入っていないため何もしない）。
+    effective_known_urls = known_urls | {listing.url for listing, _ in relisted}
+
+    print(
+        f"再掲載検知: {len(relisted)} 件 / URL使い回し疑い: {len(_url_reused_urls)} 件",
+        flush=True,
+    )
+
+    # ── 横断重複グループの検知（同一物件が複数業者から別URLで掲載されるケース）──
+    # location+area+floor_plan+age の正規化キーでグルーピングし、
+    # ・既知×新規が混在するグループの新規側 → 「別業者掲載の検知」の短文通知のみ。
+    #   フル新着通知（Gemini評価含む）には乗せない。
+    # ・全部新規のグループ → 代表（最安値）1件のみフル新着通知に乗せる。
+    #   本文末尾に dual_note（併記文）を付ける。他の新規URLは通知しない。
+    # いずれの場合も detail_fetch / reinfolib評価は current 全件が対象のため
+    # 影響を受けない（除外されるのは Gemini評価とフル新着通知のみ）。
+    from listing_group import group_listings, merge_similar_groups, select_representative, format_dual_listing_note
+
+    groups = merge_similar_groups(group_listings(current))
+    dual_listing_alerts: list[dict] = []   # 別業者掲載検知（既知×新規混在）
+    dual_note_map: dict[str, str] = {}     # 完全新規グループの代表URL → 併記文
+    duplicate_new_urls: dict[str, list[str]] = {}  # 代表URL → 同グループの非代表新規URL
+    excluded_urls: set[str] = set()        # フル新着パイプラインから除外するURL
+
+    for members in groups.values():
+        known_members = [m for m in members if m.url in effective_known_urls]
+        new_members = [m for m in members if m.url not in effective_known_urls]
+        if not new_members:
+            continue
+        if known_members:
+            cheapest_known = select_representative(known_members)
+            for nm in new_members:
+                dual_listing_alerts.append({"new": nm, "known": cheapest_known})
+                excluded_urls.add(nm.url)
+        elif len(new_members) > 1:
+            rep = select_representative(new_members)
+            dual_note_map[rep.url] = format_dual_listing_note(new_members)
+            others = [nm.url for nm in new_members if nm.url != rep.url]
+            duplicate_new_urls[rep.url] = others
+            excluded_urls.update(others)
+
+    # 別業者掲載検知は「既知物件のキャッシュ済みGemini評価」をそのまま
+    # 新規URLにもコピーする（新規API呼び出し禁止のため）。コピーしないと
+    # 次回実行時にこのURLが「既知だがgemini_evaluations未登録」として
+    # backfill_gemini_evaluations.find_backfill_targets に拾われ、
+    # 結局Gemini APIが呼ばれてしまう。
+    if dual_listing_alerts:
+        try:
+            from gemini_cache import load_gemini_evaluations, save_gemini_evaluation
+            known_eval_urls = [a["known"].url for a in dual_listing_alerts]
+            cached = load_gemini_evaluations(known_eval_urls)
+            for alert in dual_listing_alerts:
+                hit = cached.get(alert["known"].url)
+                if hit is not None:
+                    score, eval_text = hit
+                    save_gemini_evaluation(alert["new"].url, score, eval_text)
+        except Exception as e:
+            print(f"[警告] 別業者掲載検知のGemini評価コピーに失敗（通知は継続）: {e}", flush=True)
+
+    new_listings = [l for l in current if l.url not in effective_known_urls and l.url not in excluded_urls]
+    print(
+        f"新着: {len(new_listings)} 件 (既知: {len(known_urls)} 件 / "
+        f"再掲載: {len(relisted)} 件 / "
+        f"別業者掲載検知: {len(dual_listing_alerts)} 件 / "
+        f"横断重複で集約除外: {len(excluded_urls) - len(dual_listing_alerts)} 件)",
+        flush=True,
+    )
 
     # 国交省評価（current 全件。新着がなくても値下げ検知のために毎日実行）
     # ・物件を所在市でグルーピングし、エリアごとに正しいカーブで評価する。
@@ -1417,6 +1865,9 @@ def main() -> None:
         # 1日2回の定期実行で同じ変化が重複通知される事故を受け、既に同じ
         # 内容で通知済みの変化を除外する（detect_changes自体は無変更）。
         price_drop_alerts = _filter_unnotified_price_changes(price_drop_alerts)
+        # 横断重複グループ単位に集約（片方の追従値下げでグループ最安値が
+        # 動いていない場合は再通知しない。detect_changes自体は変更しない）。
+        price_drop_alerts = aggregate_alerts_by_group(price_drop_alerts, current)
         # est_map は参考枠（既知物件を含む）でも使うため current 全件に拡大する。
         # notify_line_two_stage は scored（new_listings由来のみ）しか参照しない
         # ため、この拡大は既存の2段階通知の挙動に影響しない。
@@ -1443,6 +1894,12 @@ def main() -> None:
         notify_line_price_drops(price_drop_alerts)
     else:
         print("価格変動のある物件はありませんでした。", flush=True)
+
+    # 再掲載検知通知（data.csv上書きで一時消滅→再出現した既知物件。該当0件なら内部で何も送信しない）
+    notify_line_relisted(relisted)
+
+    # 別業者掲載検知通知（横断重複グループのうち既知×新規混在。該当0件なら内部で何も送信しない）
+    notify_line_dual_listing_detected(dual_listing_alerts)
 
     # 指値候補通知（第4カテゴリ。current全件が対象のため new_listings の
     # 有無に関わらずここで送る。該当0件なら内部で何も送信しない）
@@ -1504,6 +1961,16 @@ def main() -> None:
             except Exception as e:
                 print(f"[警告] Gemini評価の保存に失敗（評価自体は継続）: {e}", flush=True)
 
+            # 横断重複グループの代表として評価された場合、同グループの他の
+            # 新規URL（非代表）にも同じ評価結果をコピーする。コピーしないと
+            # それらが「既知」になった以降の実行で backfill 対象として拾われ、
+            # 同一物件に対して重複してGemini APIが呼ばれてしまう。
+            for dup_url in duplicate_new_urls.get(listing.url, []):
+                try:
+                    save_gemini_evaluation(dup_url, score, eval_text)
+                except Exception as e:
+                    print(f"[警告] 横断重複グループへのGemini評価コピーに失敗: {e}", flush=True)
+
             if listing.url in unevaluated_known_urls:
                 # 優先評価された既知物件は、もう「新着」ではないため
                 # 2段階通知(scored/new_rejected)には入れない。
@@ -1523,7 +1990,7 @@ def main() -> None:
         print(f"4★以上: {len(scored)} 件 / 3★以下スキップ: {skipped_low_score} 件", flush=True)
 
         if scored:
-            notify_line_two_stage(scored, est_map, gemini_score_map)
+            notify_line_two_stage(scored, est_map, gemini_score_map, dual_note_map)
         else:
             print("通知対象（4★以上）の物件はありませんでした。", flush=True)
     else:

@@ -1,0 +1,60 @@
+name: 【診断専用・手動のみ】STEP4 dry_run（横断重複・再掲載・値下げ集約の通し確認）
+
+# ============================================================
+# このワークフローの目的:
+#   横断重複検知（STEP1-3）・再掲載検知（STEP2.5）の全実装を、本番の
+#   data.csv・evaluations.db・cache/ を土台に通しで動かし、LINE送信の
+#   代わりに本文を print して4経路（フル新着・別業者掲載検知・再掲載・
+#   値下げグループ集約）を目視確認するための診断専用ワークフロー。
+#
+# 安全設計:
+#   - workflow_dispatch（手動実行）のみ。スケジュール実行はしない。
+#   - actions/cache/restore（restore専用サブアクション）を使う。
+#     通常の actions/cache と違い、ジョブ終了時の自動保存が発生しない
+#     ため、dry_run_step4.py内でevaluations.dbに書き込みが発生しても
+#     本番キャッシュには一切反映されない。
+#   - permissions は contents: read のみ（書き込み権限を一切持たない）。
+#   - dry_run_step4.py内でLINE送信（requests.post）・SUUMOアクセス
+#     （scrape・detail_fetch）・Gemini呼び出しはすべてモックに差し替え、
+#     外部への実際の通信は一切発生しない。
+#   - REINFOLIB評価（build_curves.get_curve_bundle）だけは本物の
+#     cache/・REINFOLIB_API_KEY を使う（横断重複検知が依拠する
+#     curve_source・適正価格計算の実データ確認が目的のため）。
+# ============================================================
+
+on:
+  workflow_dispatch:
+
+jobs:
+  dry_run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python セットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: 依存ライブラリをインストール
+        run: pip install -r requirements.txt
+
+      - name: DB・カーブキャッシュ復元（読み取り専用・保存しない）
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            evaluations.db
+            cache
+          key: suumo-eval-db-readonly-dry-run-noop
+          restore-keys: |
+            suumo-eval-db-
+
+      - name: STEP4 dry_run 実行
+        env:
+          REINFOLIB_API_KEY: ${{ secrets.REINFOLIB_API_KEY }}
+        run: python dry_run_step4.py

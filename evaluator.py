@@ -841,6 +841,138 @@ def mark_price_change_notified(
 
 
 # ---------------------------------------------------------------------------
+# 再掲載検知（STEP 2.5）
+#
+#   data.csv は毎回スクレイプ結果で上書きされるため、「既知URL」の実体は
+#   「前回実行時に検索結果にいたURL」でしかない。検索結果から一時的に
+#   消えると data.csv 上の既知情報が消え、再出現時に新着扱いになってしまう
+#   （地政の物件で実際に確認された不具合）。
+#
+#   evaluations テーブルは observation history（観測履歴）としては
+#   途切れないため、data.csv 単独ではなく観測履歴も併用して「本当に初見か」
+#   を判定する。
+# ---------------------------------------------------------------------------
+
+def get_last_observed_attrs(url: str, db_path: Optional[Path] = None) -> Optional[dict]:
+    """
+    evaluations から該当URLの観測履歴を集約して返す。
+
+    戻り値: {"area_sqm": float|None, "building_year": int|None,
+             "floor_plan": str|None, "asking_price": float|None,
+             "first_date": str, "last_date": str}
+    （area_sqm・building_year・floor_plan・asking_price は最新行＝last_date
+     時点の値。物件の属性は本来不変だが、まれな入力ゆらぎに対しては
+     「最後に観測できた状態」を正とする）
+
+    履歴なし・DBなし・例外時は None（例外を投げない。既存関数の作法に合わせる）。
+
+    db_path: None なら呼び出し時点の DB_PATH を使う。
+    """
+    if db_path is None:
+        db_path = DB_PATH
+    if not db_path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT area_sqm, building_year, floor_plan, asking_price, evaluated_date "
+                "FROM evaluations WHERE listing_url = ? ORDER BY evaluated_date",
+                (url,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+    if not rows:
+        return None
+
+    first_date = rows[0]["evaluated_date"]
+    last = rows[-1]
+    return {
+        "area_sqm":      last["area_sqm"],
+        "building_year": last["building_year"],
+        "floor_plan":    last["floor_plan"],
+        "asking_price":  last["asking_price"],
+        "first_date":    first_date,
+        "last_date":     last["evaluated_date"],
+    }
+
+
+def _init_relist_table(conn: sqlite3.Connection) -> None:
+    """relist_notifications テーブルを作る（すでにあれば何もしない）。"""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS relist_notifications (
+            listing_url   TEXT NOT NULL,     -- 物件の一意キー（SUUMOのURL）
+            last_date     TEXT NOT NULL,     -- 再出現前の最終観測日（同じ消滅サイクルの識別）
+            notified_at   TEXT NOT NULL,     -- ISO 8601 日時（記録用）
+            PRIMARY KEY (listing_url, last_date)
+        )
+    """)
+    conn.commit()
+
+
+def is_relisted_notified(url: str, last_date: str, db_path: Optional[Path] = None) -> bool:
+    """
+    同一URLの「同じ消滅サイクル（last_date）からの再出現」を既に通知したかを返す。
+    DB未作成・例外のときは False を返す（例外は出さない。安全側＝未通知扱い）。
+
+    db_path: None なら呼び出し時点の DB_PATH を使う。
+    """
+    if db_path is None:
+        db_path = DB_PATH
+    if not db_path.exists():
+        return False
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            _init_relist_table(conn)
+            row = conn.execute(
+                "SELECT 1 FROM relist_notifications WHERE listing_url = ? AND last_date = ?",
+                (url, last_date),
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+    return row is not None
+
+
+def mark_relisted_notified(url: str, last_date: str, db_path: Optional[Path] = None) -> None:
+    """
+    「同じ消滅サイクル（last_date）からの再出現」を通知したことを記録する（UPSERT）。
+    LINE送信が成功した後にのみ呼ぶこと（他の mark_* 関数と同じ設計）。
+
+    DB書き込みに失敗しても例外は投げない。
+
+    db_path: None なら呼び出し時点の DB_PATH を使う。
+    """
+    if db_path is None:
+        db_path = DB_PATH
+    now = datetime.now().isoformat(timespec="seconds")
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            _init_relist_table(conn)
+            conn.execute(
+                """
+                INSERT INTO relist_notifications (listing_url, last_date, notified_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(listing_url, last_date) DO UPDATE SET
+                    notified_at = excluded.notified_at
+                """,
+                (url, last_date, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        logger.warning("mark_relisted_notified 失敗（通知は既に送信済み）: %s", e)
+
+
+# ---------------------------------------------------------------------------
 # エントリポイント（手動実行・動作確認用）
 # ---------------------------------------------------------------------------
 

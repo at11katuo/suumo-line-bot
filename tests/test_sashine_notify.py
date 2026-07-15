@@ -478,5 +478,5 @@ class TestMainSashineWiring:
         #   追加されたので、関数名の呼び出しがある事実だけを確認する
         #   （厳密な引数リストの文字列一致は見ない）。
         source = inspect.getsource(scraper.main)
-        assert "notify_line_two_stage(scored, est_map, gemini_score_map)" in source
+        assert "notify_line_two_stage(scored, est_map, gemini_score_map, dual_note_map)" in source
         assert "notify_line_reference(reference_candidates, est_map)" in source
