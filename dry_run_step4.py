@@ -30,8 +30,14 @@ cache/（actions/cache から読み取り専用で復元。書き込みしても
        ゼロ・経路確認を決定的にするため。reinfolib評価・DB読み書きは本物）
 
 【やらないこと（副作用最小限）】
-    - evaluations.db・cache/ の永続化（このワークフローは actions/cache/restore
-      のみを使い、save は行わない。プロセス内での書き込みは全て破棄される）
+    - evaluations.db・cache/ の永続化。GitHub Actions上は actions/cache/restore
+      のみを使い save を行わないため自動的に破棄されるが、【2026-07-17 追記】
+      それはランナーが使い捨てだから成立する保護であり、ローカル実行には
+      効かない（実際にローカル実行で本番と無関係な evaluations.db に
+      DRY_RUN注入行が永続化される事故が発生した）。そのため main() 内で
+      evaluations.db 自体も data.csv と同様スクラッチコピーに差し替え、
+      evaluator.DB_PATH（本番DBパス）には一切書き込ませない設計にしている。
+      実行後、本番DBのmtimeが変化していないかも二重チェックする。
     - 実際の data.csv への保存（コピーに対して save_listings させる）
     - LINE通知の実送信
     - SUUMOへの実アクセス（scrape・detail_fetch とも差し替え）
@@ -275,6 +281,29 @@ def main() -> None:
     scratch_data_csv = Path(tempfile.mktemp(suffix="_data.csv"))
     shutil.copy(DATA_CSV_PATH, scratch_data_csv)
 
+    # evaluations.db も同様にスクラッチコピーへ差し替える。
+    # 【2026-07-17 追記】GitHub Actions上では「actions/cache/restore のみ・
+    # save なし」により書き込みが自動的に破棄されるが、これはランナーが
+    # 使い捨てだから成立する話であり、ローカル実行にはその保護がない。
+    # 実際にローカル実行で本番と無関係な evaluations.db に [DRY_RUN注入...]
+    # 行が永続化される事故が起きたため、evaluator.DB_PATH 自体をこの
+    # スクラッチコピーに差し替え、本番DBには一切書き込ませない設計にする。
+    scratch_db_path = Path(tempfile.mktemp(suffix="_evaluations.db"))
+    if DB_PATH.exists():
+        shutil.copy(DB_PATH, scratch_db_path)
+    db_mtime_before = DB_PATH.stat().st_mtime if DB_PATH.exists() else None
+
+    import evaluator
+    import detail_fetcher
+    import gemini_cache
+
+    # 【2026-07-17 追記】detail_fetcher.py・gemini_cache.py は evaluations.db
+    # と同じファイルに detail_cache / gemini_evaluations テーブルを持つが、
+    # DB_PATH を evaluator.py から import せず、それぞれ独自に
+    # Path(__file__).parent / "evaluations.db" を定義している。
+    # evaluator.DB_PATH だけを差し替えても、この2モジュール経由の書き込み
+    # （実際に Gemini キャッシュ保存で発生した）は本番DBに漏れるため、
+    # 3箇所とも同じスクラッチコピーに差し替える。
     try:
         with patch.object(scraper, "scrape", lambda url: injected_current), \
              patch.object(scraper, "evaluate_listing", lambda listing: (5, (
@@ -290,7 +319,10 @@ def main() -> None:
              patch.object(scraper, "LINE_CHANNEL_ACCESS_TOKEN", "dry-run-dummy-token"), \
              patch.object(scraper, "LINE_USER_ID", "dry-run-dummy-user"), \
              patch.object(scraper, "DATA_FILE", str(scratch_data_csv)), \
-             patch.object(scraper, "GEMINI_EVAL_LIMIT_PER_RUN", 999):
+             patch.object(scraper, "GEMINI_EVAL_LIMIT_PER_RUN", 999), \
+             patch.object(evaluator, "DB_PATH", scratch_db_path), \
+             patch.object(detail_fetcher, "DB_PATH", scratch_db_path), \
+             patch.object(gemini_cache, "DB_PATH", scratch_db_path):
         # GEMINI_EVAL_LIMIT_PER_RUN を引き上げる理由: evaluate_listing は
         # 固定値にモック済みでAPIコストは発生しないため、本番のGemini
         # キャッシュ充足状況（未評価の既知物件バックログ）に左右されず、
@@ -302,6 +334,18 @@ def main() -> None:
             scraper.main()
     finally:
         scratch_data_csv.unlink(missing_ok=True)
+        scratch_db_path.unlink(missing_ok=True)
+
+    # 防御的二重チェック: 本番DBのmtimeが実行中に変化していないか
+    # （evaluator.DB_PATH の差し替えが何らかの理由で効かなかった場合の検知用）。
+    db_mtime_after = DB_PATH.stat().st_mtime if DB_PATH.exists() else None
+    if db_mtime_before != db_mtime_after:
+        print(
+            f"\n[警告][事故] 本番DB（{DB_PATH}）が実行中に変更された形跡があります。"
+            "スクラッチ差し替えが効いていない可能性があるため、内容を確認してください。",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     print("\n" + "=" * 70)
     print(f"=== dry_run 完了: LINE送信されるはずだった通知は {_sent_message_count} 件（実送信は発生していません） ===")
