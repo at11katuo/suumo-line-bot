@@ -8,45 +8,17 @@ DBは mode=ro で開く。書き込み・スキーマ変更・本体コードの
 """
 from __future__ import annotations
 
-import json
 import sqlite3
+import sys
 from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parent.parent / "evaluations.db"
-CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_REPO_ROOT))
+from contamination_guard import check_cache_dir, check_curve_source  # noqa: E402
+
+DB_PATH = _REPO_ROOT / "evaluations.db"
+CACHE_DIR = _REPO_ROOT / "cache"
 PROMISING_SCORE_THRESHOLD = 70  # scraper.py と同値（読み取りのみ、import はしない）
-
-# USE_MOCK_REINFOLIB汚染キャッシュの既知の目印。過去に架空地区名「テスト町」が
-# 実測値と同じ形式でDBに紛れ込み、本番と異なる数値を報告する事故があった。
-MOCK_DISTRICT_MARKERS = ("テスト町",)
-
-
-def _check_cache_contamination() -> None:
-    """
-    cache/*.json をスキャンし、district_curves に MOCK_DISTRICT_MARKERS が
-    含まれていたら即中断する。
-
-    【なぜ curve_source だけのチェックでは不十分か（2026-07-17に実際に
-    起きた事故で判明）】: 汚染時、汚染された数値は city_curve（curve_source
-    は正常な "city:府中市" のまま）にも紛れ込んでいた。district"テスト町"に
-    実際に一致しなければ curve_source の文字列だけを見ても汚染は分からない。
-    そのためDBの curve_source 列だけでなく、キャッシュJSON自体の
-    district_curves キーも直接見る必要がある。
-    """
-    if not CACHE_DIR.exists():
-        return
-    for path in CACHE_DIR.glob("*.json"):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            continue
-        district_curves = data.get("bundle", {}).get("district_curves", {})
-        hit = [d for d in district_curves if any(m in d for m in MOCK_DISTRICT_MARKERS)]
-        if hit:
-            raise SystemExit(
-                f"[汚染検知] {path} の district_curves にモック地区名 {hit} が"
-                "含まれています。USE_MOCK_REINFOLIB汚染キャッシュの疑いがあるため中断します。"
-            )
 
 
 def new_score_delta(pct: float | None) -> tuple[int, str]:
@@ -65,7 +37,7 @@ def new_score_delta(pct: float | None) -> tuple[int, str]:
 
 
 def main() -> None:
-    _check_cache_contamination()
+    check_cache_dir(CACHE_DIR)
 
     con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
     cur = con.cursor()
@@ -85,11 +57,7 @@ def main() -> None:
     rows = cur.fetchall()
 
     for url, _name, _price, _pct, _score, curve_source in rows:
-        if curve_source and any(marker in curve_source for marker in MOCK_DISTRICT_MARKERS):
-            raise SystemExit(
-                f"[汚染検知] curve_source={curve_source!r}（URL={url}）にモック地区名が"
-                "含まれています。USE_MOCK_REINFOLIB汚染キャッシュの疑いがあるため中断します。"
-            )
+        check_curve_source(curve_source, context=f"URL={url}")
 
     table = []
     upgrades = 0

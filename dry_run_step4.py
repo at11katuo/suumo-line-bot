@@ -58,9 +58,11 @@ from unittest.mock import MagicMock, patch
 
 import scraper
 from scraper import Listing
+from contamination_guard import check_cache_dir, check_curve_source
 
 DB_PATH = Path(__file__).parent / "evaluations.db"
 DATA_CSV_PATH = Path(__file__).parent / "data.csv"
+CACHE_DIR = Path(__file__).parent / "cache"
 
 HEALTH_CHECK_URL = "nc_21269843"
 
@@ -124,6 +126,12 @@ def health_check(url_fragment: str = HEALTH_CHECK_URL) -> bool:
     print("[健全性チェック] 環境汚染ゲート（前回のモックキャッシュ汚染事故の再発防止）")
     print("=" * 70)
 
+    # 【2026-07-17 追記】cache/*.json自体を直接スキャンする（curve_source文字列
+    # だけでは、汚染がcity_curveへのフォールバック経由で紛れ込んだ場合に
+    # 検知できないことが実際の事故で判明したため。contamination_guard.py参照）。
+    check_cache_dir(CACHE_DIR)
+    print("[健全性チェック] cache/*.json のモック地区スキャン: 検知なし")
+
     fresh = _independent_estimate(url_fragment)
     if fresh is None:
         print("[健全性チェック] 再計算できなかったため判定不能。dry_runは継続します（結果の数値は参考程度に）。")
@@ -163,6 +171,8 @@ def health_check(url_fragment: str = HEALTH_CHECK_URL) -> bool:
         f"  独立再計算          : curve_source={fresh['curve_source']!r} "
         f"適正㎡単価={fresh['current_fair_unit_price']} 実勢比={fresh['asking_vs_fair_pct']}"
     )
+    check_curve_source(row["curve_source"], context="DB最新行")
+    check_curve_source(fresh["curve_source"], context="独立再計算")
 
     ok = (
         row["curve_source"] == fresh["curve_source"]
@@ -226,13 +236,28 @@ def build_injected_current() -> list[Listing]:
         floor_plan="3LDK", area="90.02m2（壁芯）", age="2003年7月",
     ))
 
-    # (D) 値下げグループ集約 → 紅葉丘2の既知メンバーのうち1件をさらに値下げ
+    # (D) 値下げグループ集約 ＋ score_gain/price_drop複合アラート確認
+    #     → 紅葉丘2グループの既知メンバーのうち1件をさらに大幅値下げする。
+    #     優先的に nc_20544700（紅葉丘2最安・実勢比+8.1%圏＝「やや割高」
+    #     -5点バケット）を狙う。新スコア式で深い値下げが割安圏(-10%超)
+    #     まで実勢比を押し下げると+8点バケットへ一気に移動し、price_drop
+    #     （50万円以上）・score_gain（10点以上）の両条件を同時に満たす。
+    #     この「両方満たす」ケースはprice_drop起因として扱われ、
+    #     SUPPRESS_SCORE_GAIN_ALERTS=1下でも通知される設計（STEP3参照）。
+    #     値下げ幅は実勢比を-10%超まで押し下げる4290万円とする
+    #     （元5190万円 → -900万円）。
+    #     万一 data.csv から消えていた場合は、グループ内でURL文字列が
+    #     最小のメンバーにフォールバックする（値下げグループ集約経路
+    #     自体の確認は継続する）。
     momiji_known = [l for l in base if l.location.startswith("東京都府中市紅葉丘")]
     result = [l for l in base if l not in momiji_known]
     if momiji_known:
-        cheapest = min(momiji_known, key=lambda l: l.url)  # 決定的に1件選ぶ
-        result.extend(l for l in momiji_known if l.url != cheapest.url)
-        result.append(replace(cheapest, price="4990万円"))
+        target = next((l for l in momiji_known if "nc_20544700" in l.url), None)
+        if target is None:
+            target = min(momiji_known, key=lambda l: l.url)  # フォールバック: 決定的に1件選ぶ
+            print(f"[dry_run][情報] nc_20544700 が data.csv に見つからず、{target.url} で代替します。")
+        result.extend(l for l in momiji_known if l.url != target.url)
+        result.append(replace(target, price="4290万円"))
     else:
         print("[dry_run][警告] 紅葉丘2の既知物件が data.csv に見つからず、値下げグループ集約経路をスキップします。")
 

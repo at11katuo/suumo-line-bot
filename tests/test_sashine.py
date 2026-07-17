@@ -287,6 +287,52 @@ class TestRecalcEstimateAtPrice:
 
 
 # ---------------------------------------------------------------------------
+# STEP4-4. 指値を深くするとスコアが単調非減少（docs/score-fairness-spec.md
+# STEP4新規テスト4）
+# ---------------------------------------------------------------------------
+
+class TestScoreMonotonicWithNegotiatedPrice:
+    """
+    resale_scoreがasking_vs_fair_pctの段階加減点を含むようになった
+    （STEP2）ため、指値（negotiated_price）を深くする＝実勢比を下げる
+    ほど、スコアは単調非減少（下がらない）ことを確認する。
+    段階加減点のバケット境界（+30/+15/+8/-10%）はどれも「pctが下がる
+    ほど加点が有利になる」方向にしか動かないため、構造的に保証される
+    はずの性質だが、回帰確認として固定する。
+    """
+
+    def test_score_non_decreasing_as_price_decreases(self, candidate, curve):
+        # 期待値は手計算後、実際に関数を実行して数値を照合してから
+        # 埋め込んでいる（curve fixture: fair_price_now=50,400,000）。
+        # 60,000,000(vs_fair+19.05%)以降、価格を下げるごとに実勢比が
+        # 下がり、+30/+15/+8/-10%のバケット境界を順にまたいで
+        # 78→85→90→90→90→98→98→98 と単調非減少になる。
+        prices = [
+            60_000_000, 55_000_000, 53_000_000,
+            51_150_000, 49_500_000, 45_000_000,
+            40_000_000, 30_000_000,
+        ]
+        scores = [
+            recalc_estimate_at_price(candidate, curve, 2026, 10, p).resale_score
+            for p in prices
+        ]
+        assert scores == [78, 85, 90, 90, 90, 98, 98, 98]
+        for earlier, later in zip(scores, scores[1:]):
+            assert later >= earlier, f"価格を下げたのにスコアが下がった: {scores}"
+
+    def test_score_never_decreases_across_arbitrary_price_grid(self, candidate, curve):
+        # 上のテストとは別の細かい価格グリッド（100万円刻み）でも
+        # 単調非減少が崩れないことを、境界値に依存しない形で確認する。
+        prices = sorted(range(30_000_000, 61_000_000, 1_000_000), reverse=True)
+        scores = [
+            recalc_estimate_at_price(candidate, curve, 2026, 10, p).resale_score
+            for p in prices
+        ]
+        for earlier, later in zip(scores, scores[1:]):
+            assert later >= earlier, f"価格を下げたのにスコアが下がった: price={prices}, score={scores}"
+
+
+# ---------------------------------------------------------------------------
 # STEP2-2. 不正入力（例外を投げず None を返す）
 # ---------------------------------------------------------------------------
 
