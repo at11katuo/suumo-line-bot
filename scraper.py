@@ -688,6 +688,24 @@ def _price_change_dedup_args(alert: dict) -> tuple:
     )
 
 
+def _filter_score_gain_only_alerts(alerts: list[dict], min_price_drop: int) -> list[dict]:
+    """
+    SUPPRESS_SCORE_GAIN_ALERTS=1 のとき、score_gain起因「のみ」のアラートを
+    除外する（docs/score-fairness-spec.md STEP3。新旧スコア式の断層で
+    偽のscore_gainアラートが出るデプロイ初日対策）。
+
+    price_drop >= min_price_drop を満たすアラートは、score_gainも同時に
+    条件を満たしていても常に残す（price_drop起因として扱う）。値下げが
+    新式スコアの+8点加点を誘発して両条件を同時に満たすケースは実在し
+    （割安化したことの検知そのもの）、これを握りつぶすと「割安な物件を買う」
+    という目的に反するため、値下げ情報を優先する設計判断。
+
+    detect_changes 自体は変更しない。呼び出し直後にかける追加の層で、
+    _filter_unnotified_price_changes と同じ位置づけ。
+    """
+    return [a for a in alerts if a.get("price_drop", 0) >= min_price_drop]
+
+
 def _filter_unnotified_price_changes(alerts: list[dict], db_path=None) -> list[dict]:
     """
     detect_changes の結果から、既に同じ内容（URL＋旧価格→新価格＋
@@ -1695,6 +1713,19 @@ def main() -> None:
     print("=== 不動産スクレイパー 開始 ===", flush=True)
     print(f"対象URL: {TARGET_URL}", flush=True)
 
+    # SUPPRESS_SCORE_GAIN_ALERTS はデプロイ初回runのみ立てて翌日には
+    # 外す運用の一時変数（README参照）。GitHub Actionsのvars/secretsは
+    # 外し忘れが起きやすく、立ちっぱなしだとscore_gain起因のアラートが
+    # 永久に沈黙するため、実行のたびにログ冒頭で目立つ警告を出す。
+    if os.environ.get("SUPPRESS_SCORE_GAIN_ALERTS") == "1":
+        print(
+            "[警告] SUPPRESS_SCORE_GAIN_ALERTS=1 が設定されています。"
+            "score_gain起因のみのアラート（price_dropを伴わないスコア改善）は"
+            "抑制されます。デプロイ初回run専用の一時変数です。外し忘れていないか"
+            "確認してください（翌日には外す運用）。",
+            flush=True,
+        )
+
     # スクレイピング
     current = scrape(TARGET_URL)
     if not current:
@@ -1862,6 +1893,17 @@ def main() -> None:
             sashine_candidates = []
 
         price_drop_alerts = detect_changes([l.url for l in current])
+        if os.environ.get("SUPPRESS_SCORE_GAIN_ALERTS") == "1":
+            from evaluator import PRICE_DROP_THRESHOLD
+            before_count = len(price_drop_alerts)
+            price_drop_alerts = _filter_score_gain_only_alerts(price_drop_alerts, PRICE_DROP_THRESHOLD)
+            suppressed_count = before_count - len(price_drop_alerts)
+            if suppressed_count:
+                print(
+                    f"[SUPPRESS_SCORE_GAIN_ALERTS] score_gain起因のみのアラート"
+                    f"{suppressed_count}件を抑制しました（price_drop起因のアラートは抑制していません）。",
+                    flush=True,
+                )
         # 1日2回の定期実行で同じ変化が重複通知される事故を受け、既に同じ
         # 内容で通知済みの変化を除外する（detect_changes自体は無変更）。
         price_drop_alerts = _filter_unnotified_price_changes(price_drop_alerts)
