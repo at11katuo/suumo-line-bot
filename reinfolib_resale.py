@@ -347,7 +347,7 @@ def estimate_resale(
         if gain > 30_000_000:
             notes.append("売却益が3000万特別控除を超過。次物件の住宅ローン控除とは併用不可な点に注意。")
 
-    score = _resale_score(cand, current_age, future_age, curve, notes)
+    score = _resale_score(cand, current_age, future_age, curve, notes, asking_vs_fair)
 
     return ResaleEstimate(
         current_fair_unit_price=fair_unit_now,
@@ -369,8 +369,17 @@ def _resale_score(
     future_age: int,
     curve: DepreciationCurve,
     notes: list[str],
+    asking_vs_fair_pct: Optional[float] = None,
 ) -> int:
-    """ヤドカリ出口（住みたいファミリーに売る）視点の流動性スコア 0-100。"""
+    """
+    ヤドカリ出口（住みたいファミリーに売る）視点の流動性スコア 0-100。
+
+    asking_vs_fair_pct（実勢比。+なら割高、-なら割安）を段階的に加減点する。
+    このシステムの目的は「割安な物件を買う」ことであり、流動性が高くても
+    割高な物件が高得点に見えるのは目的に反するため（docs/score-fairness-spec.md
+    参照）。減点を加点より重くしているのは意図的な非対称設計で、割高を掴まない
+    ことを割安を見つけることより優先する。
+    """
     score = 50
 
     if cand.walk_minutes is not None:
@@ -404,6 +413,20 @@ def _resale_score(
         notes.append(f"売却想定時に築{future_age}年。築25年超は買い手のローン審査が厳しくなる。")
     elif future_age <= 20:
         score += 7
+
+    if asking_vs_fair_pct is not None:
+        pct = asking_vs_fair_pct
+        if pct >= 30:
+            score -= 20
+            notes.append(f"実勢比+{pct:.1f}%は大幅割高。出口での値下がり余地が大きい。")
+        elif pct >= 15:
+            score -= 12
+            notes.append(f"実勢比+{pct:.1f}%は割高。指値交渉の前提で検討要。")
+        elif pct >= 8:
+            score -= 5
+        elif pct <= -10:
+            score += 8
+            notes.append(f"実勢比{pct:.1f}%は割安圏。")
 
     return max(0, min(100, score))
 

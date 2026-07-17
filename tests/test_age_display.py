@@ -267,5 +267,8 @@ class TestScoringUnaffectedByAgeDisplayChange:
         )
         est_old = estimate_resale(candidate_old, _CURVE, current_year=2026, hold_years=10)
 
-        # 若い方がスコアが高くなる（+7 vs -12の差、19点分）ことを確認
+        # 若い方がスコアが高くなることを確認。
+        # 【2026-07-17〜】resale_scoreはasking_vs_fair_pctの加減点も含むため
+        # 差の絶対値は元の「+7 vs -12」の19点ちょうどではなくなったが、
+        # 不等号（young > old）は本テストの主眼であり変わらず成立する。
         assert est_young.resale_score > est_old.resale_score

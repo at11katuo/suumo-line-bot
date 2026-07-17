@@ -169,11 +169,16 @@ def recalc_estimate_at_price(
     落としどころ・引き際のいずれでもよい）に差し替え、
     reinfolib_resale.estimate_resale をそのまま再実行する。
 
-    新しい乖離率の計算式は作らない。fair_price_now・future_resale_price・
-    resale_score は asking_price に依存しない値のため（curve・area_sqm・
-    building_year・walk_minutes 等からのみ算出される）、Candidate をまるごと
-    差し替えて estimate_resale を再実行すれば、通常評価と指値後評価の
-    計算方法が常に一致する。
+    新しい乖離率の計算式は作らない。fair_price_now・future_resale_price は
+    asking_price に依存しない値（curve・area_sqm・building_year・
+    walk_minutes 等からのみ算出される）だが、【2026-07-17 設計変更】
+    resale_score は asking_vs_fair_pct（実勢比）の段階加減点を組み込んだため
+    asking_price に依存するようになった（docs/score-fairness-spec.md 参照。
+    割安な物件を買うという目的に対し、割高な物件が高スコアに見えるのを防ぐ
+    ため）。それでも計算整合は保たれる: Candidate をまるごと差し替えて
+    estimate_resale を再実行する方式のため、指値価格での asking_vs_fair_pct
+    も同時に再計算され、指値が深くなるほど score が単調に改善する
+    （むしろ「指値が通れば割安になり有望化する」が正しく反映されるようになった）。
 
     引数:
         cand             : 元の Candidate（asking_price 以外はそのまま使う）

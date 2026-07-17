@@ -221,7 +221,10 @@ def curve() -> DepreciationCurve:
 @pytest.fixture
 def candidate() -> Candidate:
     # walk<=7(+15) / 65<=area<=80(+10) / units>=50(+8) / repair>=200(±0) / future_age18<=20(+7)
-    # → resale_score = 50+15+10+8+7 = 90（asking_price には一切依存しない）
+    # → 5要素ベーススコア = 50+15+10+8+7 = 90。
+    # 【2026-07-17〜】ここに asking_vs_fair_pct の段階加減点が乗るため、
+    # 実際の resale_score は asking_price に依存する（55,000,000円・vs_fair
+    # +9.13%なら「やや割高」-5点で85点。詳細は各テストのコメント参照）。
     return Candidate(
         asking_price=55_000_000,  # 5,500万円（fair 5,040万円に対し約+9.1%の割高）
         area_sqm=72,
@@ -257,12 +260,16 @@ class TestRecalcEstimateAtPrice:
         result = recalc_estimate_at_price(candidate, curve, 2026, 10, 51_150_000)
         assert result.asking_vs_fair_pct == pytest.approx(1.488095, abs=1e-4)
 
-    def test_resale_score_unchanged_by_price(self, candidate, curve):
-        # resale_score は asking_price に依存しないため、価格を変えても
-        # スコアは元の評価と完全に同じになること（今回の設計の核心）
+    def test_resale_score_changes_with_price_via_vs_fair(self, candidate, curve):
+        # 【2026-07-17 設計変更】resale_score は asking_vs_fair_pct の段階加減点を
+        # 組み込んだため、asking_price に依存するようになった（バグではなく
+        # 意図した設計変更。docs/score-fairness-spec.md 参照）。
+        # 元の売出価格(5500万・vs_fair+9.13%)は「やや割高」バケット(-5点)で85点。
+        # 標準指値の落としどころ(5115万・vs_fair+1.49%)は無加減点ゾーンで90点のまま。
         original = estimate_resale(candidate, curve, 2026, 10)
         at_target = recalc_estimate_at_price(candidate, curve, 2026, 10, 51_150_000)
-        assert original.resale_score == at_target.resale_score == 90
+        assert original.resale_score == 85
+        assert at_target.resale_score == 90
 
     def test_original_asking_price_not_mutated(self, candidate, curve):
         # 元の candidate オブジェクトは変更されない（dataclasses.replace は
@@ -496,9 +503,11 @@ class TestFindSashineCandidateGateConditions:
         assert result is None
 
     def test_condition2_alone_blocks_when_score_too_low_even_at_target(self, curve):
-        # 条件2: resale_score は asking_price に依存しないため、スコアが
-        # 低い物件はどれだけ値引きしても target 価格でもスコアは変わらず
-        # 非有望のまま → 条件1・3・4は満たしても条件2で除外される
+        # 条件2: この物件は5要素ベーススコアが2点と極端に低く、
+        # asking_vs_fair_pct の加減点（最大+8点）を足しても70点に届かない
+        # ため、target 価格でも非有望のまま → 条件1・3・4は満たしても
+        # 条件2で除外される（【2026-07-17〜】resale_scoreはasking_priceに
+        # 依存するようになったが、この物件はベースが低すぎて結論は変わらない）
         low_score_cand = Candidate(
             asking_price=60_000_000, area_sqm=40, building_year=1998,
             walk_minutes=15, total_units=10, repair_fund_per_sqm=100,
