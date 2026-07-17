@@ -96,6 +96,10 @@ jobs:
           REINFOLIB_API_KEY: ${{ secrets.REINFOLIB_API_KEY }}
           # 検索URLをカスタマイズしたい場合は Secrets に TARGET_URL を追加
           TARGET_URL: ${{ secrets.TARGET_URL }}
+          # デプロイ初日限定の一時変数（docs/score-fairness-spec.md STEP3・README運用メモ参照）。
+          # リポジトリ変数 vars.SUPPRESS_SCORE_GAIN_ALERTS を "1" にすると
+          # score_gain起因のみのアラートを抑制する。翌日には必ず削除すること。
+          SUPPRESS_SCORE_GAIN_ALERTS: ${{ vars.SUPPRESS_SCORE_GAIN_ALERTS }}
         run: python scraper.py
 
       # ---- 6. data.csv の変更を自動コミット ----
