@@ -1,0 +1,59 @@
+name: 【診断専用・手動のみ】score-fairness-spec STEP1 対照表
+
+# ============================================================
+# このワークフローの目的:
+#   本番のDB（evaluations.db）は actions/cache 内にのみ存在し、
+#   ローカルファイルからは中身を確認できない
+#   （check_curve_source_history.yml と同じ制約）。
+#
+#   docs/score-fairness-spec.md STEP1 で求められている「現行36件の
+#   現行スコア・実勢比・新式スコアの対照表」を、本番の実データに対して
+#   読み取り専用で取得するための診断専用ワークフロー。
+#
+#   【2026-07-17 追記】この対照表を最初にローカルの evaluations.db で
+#   作成したところ、(1) dry_run_step4.py のローカル実行で紛れ込んだ
+#   [DRY_RUN注入...] 行4件、(2) USE_MOCK_REINFOLIB汚染キャッシュ由来の
+#   架空カーブ値、の二重の汚染により、本番とは異なる（実勢比の符号すら
+#   反転する）数値を報告してしまう事故があった。このワークフローは
+#   その反省を踏まえ、必ず本番の actions/cache 経由でのみ実行する。
+#
+# 安全設計（check_curve_source_history.yml と同一パターン）:
+#   - workflow_dispatch（手動実行）のみ。スケジュール実行はしない。
+#   - actions/cache/restore（restore専用サブアクション）を使う。
+#     通常の actions/cache と違い、ジョブ終了時の自動保存が発生しない
+#     ため、本当に読み取り専用のまま終わる（キャッシュへの書き戻しなし）。
+#   - permissions は contents: read のみ（書き込み権限を一切持たない）。
+#   - SUUMOへのアクセス・LINE通知・data.csvの変更は一切行わない。
+# ============================================================
+
+on:
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python セットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          # sqlite3・pathlib は標準ライブラリのみ使用のため pip install 不要
+
+      - name: DB・カーブキャッシュ復元（読み取り専用・保存しない）
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            evaluations.db
+            cache
+          key: suumo-eval-db-readonly-check-noop
+          restore-keys: |
+            suumo-eval-db-
+
+      - name: スコア影響対照表を確認（読み取り専用）
+        run: python scripts/inspect_score_impact.py
